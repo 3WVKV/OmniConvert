@@ -38,14 +38,14 @@ export function PdfSignaturePage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [drawing, setDrawing] = useState(false);
 
-  const loadPdf = useCallback(async (files: File[]) => {
-    const file = files[0];
-    if (!file) return;
-    const path = (file as unknown as { path?: string }).path || file.name;
+  const loadPdf = useCallback(async (paths: string[]) => {
+    const path = paths[0];
+    if (!path) return;
     try {
+      const fileInfo = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
       const info = await invoke<{ page_count: number }>("get_pdf_info", { path });
       setPdfPath(path);
-      setPdfName(file.name);
+      setPdfName(fileInfo.name);
       setPageCount(info.page_count);
       setCurrentPage(1);
       await renderPage(path, 1);
@@ -195,9 +195,9 @@ export function PdfSignaturePage() {
         <DropZone
           label={t("pdfSignature.loadPdf")}
           activeLabel={t("converter.dropzoneActive")}
-          accept=".pdf"
+          extensions={["pdf"]}
           multiple={false}
-          onFiles={loadPdf}
+          onPaths={loadPdf}
           className="flex-1"
         />
       ) : (

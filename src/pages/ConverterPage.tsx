@@ -29,19 +29,24 @@ export function ConverterPage() {
   const [targetFormat, setTargetFormat] = useState<string>("");
   const [converting, setConverting] = useState(false);
 
-  const handleFiles = useCallback((files: File[]) => {
-    const entries: FileEntry[] = files.map((f) => {
-      const ext = f.name.split(".").pop()?.toLowerCase() || "";
-      return {
-        id: crypto.randomUUID(),
-        name: f.name,
-        path: (f as unknown as { path?: string }).path || f.name,
-        size: f.size,
-        extension: ext,
-        category: detectCategory(ext) || "document",
-      };
-    });
-    addConverterFiles(entries);
+  const handlePaths = useCallback(async (paths: string[]) => {
+    const entries: FileEntry[] = [];
+    for (const path of paths) {
+      try {
+        const info = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
+        entries.push({
+          id: crypto.randomUUID(),
+          name: info.name,
+          path,
+          size: info.size,
+          extension: info.extension,
+          category: detectCategory(info.extension) || "document",
+        });
+      } catch (err) {
+        toast.error(String(err));
+      }
+    }
+    if (entries.length > 0) addConverterFiles(entries);
   }, [addConverterFiles]);
 
   const availableTargets = (() => {
@@ -119,7 +124,7 @@ export function ConverterPage() {
             availableTargets={availableTargets}
             converting={converting}
             options={converterOptions}
-            onFiles={handleFiles}
+            onPaths={handlePaths}
             onRemove={removeConverterFile}
             onClear={clearConverterFiles}
             onTargetChange={setTargetFormat}
@@ -137,7 +142,7 @@ export function ConverterPage() {
             availableTargets={availableTargets}
             converting={converting}
             options={converterOptions}
-            onFiles={handleFiles}
+            onPaths={handlePaths}
             onRemove={removeConverterFile}
             onClear={clearConverterFiles}
             onTargetChange={setTargetFormat}
@@ -159,7 +164,7 @@ interface ConverterContentProps {
   availableTargets: string[];
   converting: boolean;
   options: { quality?: number; compressionLevel?: number; preserveMetadata?: boolean };
-  onFiles: (files: File[]) => void;
+  onPaths: (paths: string[]) => void;
   onRemove: (id: string) => void;
   onClear: () => void;
   onTargetChange: (f: string) => void;
@@ -171,7 +176,7 @@ interface ConverterContentProps {
 
 function ConverterContent({
   files, jobs, targetFormat, availableTargets, converting, options,
-  onFiles, onRemove, onClear, onTargetChange, onOptionsChange, onConvert, t, batch,
+  onPaths, onRemove, onClear, onTargetChange, onOptionsChange, onConvert, t, batch,
 }: ConverterContentProps) {
   const showQuality = files.length > 0 && ["image", "audio", "video"].includes(
     detectCategory(files[0].extension) || ""
@@ -185,7 +190,7 @@ function ConverterContent({
             label={t("converter.dropzone")}
             activeLabel={t("converter.dropzoneActive")}
             multiple={batch}
-            onFiles={onFiles}
+            onPaths={onPaths}
             className="flex-1"
           />
         ) : (
@@ -223,7 +228,7 @@ function ConverterContent({
                 label={t("converter.dropzone")}
                 activeLabel={t("converter.dropzoneActive")}
                 multiple
-                onFiles={onFiles}
+                onPaths={onPaths}
                 className="h-20"
               />
             )}

@@ -20,29 +20,30 @@ export function PdfMergePage() {
   const [merging, setMerging] = useState(false);
   const [dragIdx, setDragIdx] = useState<number | null>(null);
 
-  const handleFiles = useCallback(async (files: File[]) => {
-    const pdfFiles = files.filter((f) => f.name.toLowerCase().endsWith(".pdf"));
-    if (pdfFiles.length === 0) return;
+  const handlePaths = useCallback(async (paths: string[]) => {
+    const pdfPaths = paths.filter((p) => p.toLowerCase().endsWith(".pdf"));
+    if (pdfPaths.length === 0) return;
 
     const docs: PdfDocument[] = [];
-    for (const f of pdfFiles) {
+    for (const path of pdfPaths) {
       try {
-        const path = (f as unknown as { path?: string }).path || f.name;
+        const fileInfo = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
         const info = await invoke<{ page_count: number; file_size: number }>("get_pdf_info", { path });
         docs.push({
           id: crypto.randomUUID(),
-          name: f.name,
+          name: fileInfo.name,
           path,
           pageCount: info.page_count,
           fileSize: info.file_size,
         });
       } catch {
+        const name = path.split(/[\\/]/).pop() || path;
         docs.push({
           id: crypto.randomUUID(),
-          name: f.name,
-          path: (f as unknown as { path?: string }).path || f.name,
+          name,
+          path,
           pageCount: 0,
-          fileSize: f.size,
+          fileSize: 0,
         });
       }
     }
@@ -93,9 +94,9 @@ export function PdfMergePage() {
         <DropZone
           label={t("pdfMerge.dropzone")}
           activeLabel={t("converter.dropzoneActive")}
-          accept=".pdf"
+          extensions={["pdf"]}
           multiple
-          onFiles={handleFiles}
+          onPaths={handlePaths}
           className="flex-1"
         />
       ) : (
@@ -148,9 +149,9 @@ export function PdfMergePage() {
           <DropZone
             label={t("pdfMerge.addFiles")}
             activeLabel={t("converter.dropzoneActive")}
-            accept=".pdf"
+            extensions={["pdf"]}
             multiple
-            onFiles={handleFiles}
+            onPaths={handlePaths}
             className="h-20"
           />
 

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -34,21 +34,21 @@ export function PdfToolkitPage() {
   // Compress
   const [compressionLevel, setCompressionLevel] = useState<CompressionQuality>("medium");
 
-  const loadPdf = async (files: File[]) => {
-    const file = files[0];
-    if (!file) return;
-    const path = (file as unknown as { path?: string }).path || file.name;
+  const loadPdf = useCallback(async (paths: string[]) => {
+    const path = paths[0];
+    if (!path) return;
     try {
+      const fileInfo = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
       const info = await invoke<{ page_count: number }>("get_pdf_info", { path });
       setPdfPath(path);
-      setPdfName(file.name);
+      setPdfName(fileInfo.name);
       setPageCount(info.page_count);
       setCurrentPage(1);
       await renderPage(path, 1);
     } catch (err) {
       toast.error(String(err));
     }
-  };
+  }, []);
 
   const renderPage = async (path: string, page: number) => {
     try {
@@ -182,9 +182,9 @@ export function PdfToolkitPage() {
         <DropZone
           label={t("pdfToolkit.loadPdf")}
           activeLabel={t("converter.dropzoneActive")}
-          accept=".pdf"
+          extensions={["pdf"]}
           multiple={false}
-          onFiles={loadPdf}
+          onPaths={loadPdf}
           className="flex-1"
         />
       ) : (

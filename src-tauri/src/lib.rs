@@ -523,6 +523,24 @@ fn apply_signature(
     Ok(output_path)
 }
 
+#[derive(Serialize)]
+struct FileInfo {
+    name: String,
+    size: u64,
+    extension: String,
+}
+
+#[tauri::command]
+fn get_file_info(path: String) -> Result<FileInfo, String> {
+    let p = Path::new(&path);
+    let metadata = fs::metadata(&path).map_err(|e| format!("File error: {}", e))?;
+    Ok(FileInfo {
+        name: p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        size: metadata.len(),
+        extension: p.extension().unwrap_or_default().to_string_lossy().to_lowercase(),
+    })
+}
+
 #[tauri::command]
 fn read_file_base64(path: String) -> Result<String, String> {
     let bytes = fs::read(&path).map_err(|e| format!("Read error: {}", e))?;
@@ -605,6 +623,7 @@ pub fn run() {
             pdf_to_images,
             pdf_to_text,
             apply_signature,
+            get_file_info,
             read_file_base64,
             write_text_file,
             ocr_extract,

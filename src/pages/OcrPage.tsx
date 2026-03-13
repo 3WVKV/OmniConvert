@@ -22,13 +22,17 @@ export function OcrPage() {
   const [extracting, setExtracting] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const handleFiles = useCallback((files: File[]) => {
-    const file = files[0];
-    if (!file) return;
-    const path = (file as unknown as { path?: string }).path || file.name;
-    setFilePath(path);
-    setFileName(file.name);
-    setExtractedText("");
+  const handlePaths = useCallback(async (paths: string[]) => {
+    const path = paths[0];
+    if (!path) return;
+    try {
+      const fileInfo = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
+      setFilePath(path);
+      setFileName(fileInfo.name);
+      setExtractedText("");
+    } catch (err) {
+      toast.error(String(err));
+    }
   }, []);
 
   const handleExtract = async () => {
@@ -85,9 +89,9 @@ export function OcrPage() {
         <DropZone
           label={t("ocr.dropzone")}
           activeLabel={t("converter.dropzoneActive")}
-          accept=".png,.jpg,.jpeg,.bmp,.tiff,.webp,.pdf"
+          extensions={["png", "jpg", "jpeg", "bmp", "tiff", "webp", "pdf"]}
           multiple={false}
-          onFiles={handleFiles}
+          onPaths={handlePaths}
           className="flex-1"
         />
       ) : (
