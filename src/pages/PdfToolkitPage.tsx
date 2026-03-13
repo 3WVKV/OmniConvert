@@ -13,16 +13,19 @@ import {
   Loader2, ChevronLeft, ChevronRight,
 } from "lucide-react";
 import type { CompressionQuality } from "@/types/pdf";
+import { renderPdfPageToBase64 } from "@/lib/pdfRenderer";
 import { toast } from "sonner";
 
 export function PdfToolkitPage() {
   const { t } = useTranslation();
 
   const [pdfPath, setPdfPath] = useState<string | null>(null);
+  const [pdfBase64, setPdfBase64] = useState<string | null>(null);
   const [pdfName, setPdfName] = useState("");
   const [pageCount, setPageCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
-  const [pageImageBase64, setPageImageBase64] = useState<string | null>(null);
+  const [pageImageSrc, setPageImageSrc] = useState<string | null>(null);
+  const [loadingPage, setLoadingPage] = useState(false);
   const [processing, setProcessing] = useState(false);
 
   // Split / Extract
@@ -34,35 +37,39 @@ export function PdfToolkitPage() {
   // Compress
   const [compressionLevel, setCompressionLevel] = useState<CompressionQuality>("medium");
 
+  const renderPage = useCallback(async (base64: string, page: number) => {
+    setLoadingPage(true);
+    try {
+      const dataUrl = await renderPdfPageToBase64(base64, page);
+      setPageImageSrc(dataUrl);
+    } catch {
+      setPageImageSrc(null);
+    }
+    setLoadingPage(false);
+  }, []);
+
   const loadPdf = useCallback(async (paths: string[]) => {
     const path = paths[0];
     if (!path) return;
     try {
       const fileInfo = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
       const info = await invoke<{ page_count: number }>("get_pdf_info", { path });
+      const base64 = await invoke<string>("read_file_base64", { path });
       setPdfPath(path);
+      setPdfBase64(base64);
       setPdfName(fileInfo.name);
       setPageCount(info.page_count);
       setCurrentPage(1);
-      await renderPage(path, 1);
+      await renderPage(base64, 1);
     } catch (err) {
       toast.error(String(err));
     }
-  }, []);
-
-  const renderPage = async (path: string, page: number) => {
-    try {
-      const base64 = await invoke<string>("render_pdf_page", { path, pageNumber: page });
-      setPageImageBase64(base64);
-    } catch {
-      setPageImageBase64(null);
-    }
-  };
+  }, [renderPage]);
 
   const goToPage = async (page: number) => {
-    if (!pdfPath || page < 1 || page > pageCount) return;
+    if (!pdfBase64 || page < 1 || page > pageCount) return;
     setCurrentPage(page);
-    await renderPage(pdfPath, page);
+    await renderPage(pdfBase64, page);
   };
 
   const handleSplit = async () => {
@@ -201,13 +208,18 @@ export function PdfToolkitPage() {
               <Button variant="ghost" size="icon" onClick={() => goToPage(currentPage + 1)} disabled={currentPage >= pageCount}>
                 <ChevronRight className="h-4 w-4" />
               </Button>
-              <Button variant="ghost" size="sm" onClick={() => { setPdfPath(null); setPageImageBase64(null); }}>
+              <Button variant="ghost" size="sm" onClick={() => { setPdfPath(null); setPdfBase64(null); setPageImageSrc(null); }}>
                 {t("common.close")}
               </Button>
             </div>
             <div className="flex-1 overflow-auto rounded-lg border bg-white min-h-0">
-              {pageImageBase64 ? (
-                <img src={`data:image/png;base64,${pageImageBase64}`} alt="PDF page" className="max-w-full" />
+              {loadingPage ? (
+                <div className="flex h-full items-center justify-center text-muted-foreground">
+                  <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                  {t("common.loading")}
+                </div>
+              ) : pageImageSrc ? (
+                <img src={pageImageSrc} alt="PDF page" className="max-w-full" />
               ) : (
                 <div className="flex h-full items-center justify-center text-muted-foreground">
                   {t("common.loading")}

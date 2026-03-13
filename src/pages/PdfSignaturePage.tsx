@@ -15,6 +15,7 @@ import {
   CalendarDays, Loader2, Download,
 } from "lucide-react";
 import type { SignatureMode, SavedSignature, SignaturePlacement } from "@/types/pdf";
+import { renderPdfPageToBase64 } from "@/lib/pdfRenderer";
 import { toast } from "sonner";
 
 export function PdfSignaturePage() {
@@ -22,10 +23,12 @@ export function PdfSignaturePage() {
   const { savedSignatures, addSavedSignature, removeSavedSignature } = useAppStore();
 
   const [pdfPath, setPdfPath] = useState<string | null>(null);
+  const [pdfBase64, setPdfBase64] = useState<string | null>(null);
   const [pdfName, setPdfName] = useState("");
   const [pageCount, setPageCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
-  const [pageImageBase64, setPageImageBase64] = useState<string | null>(null);
+  const [pageImageSrc, setPageImageSrc] = useState<string | null>(null);
+  const [loadingPage, setLoadingPage] = useState(false);
 
   const [signatureMode, setSignatureMode] = useState<SignatureMode>("draw");
   const [signatureImage, setSignatureImage] = useState<string | null>(null);
@@ -34,9 +37,19 @@ export function PdfSignaturePage() {
   const [addDate, setAddDate] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // Canvas for drawing
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [drawing, setDrawing] = useState(false);
+
+  const renderPage = useCallback(async (base64: string, page: number) => {
+    setLoadingPage(true);
+    try {
+      const dataUrl = await renderPdfPageToBase64(base64, page);
+      setPageImageSrc(dataUrl);
+    } catch {
+      setPageImageSrc(null);
+    }
+    setLoadingPage(false);
+  }, []);
 
   const loadPdf = useCallback(async (paths: string[]) => {
     const path = paths[0];
@@ -44,29 +57,23 @@ export function PdfSignaturePage() {
     try {
       const fileInfo = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
       const info = await invoke<{ page_count: number }>("get_pdf_info", { path });
+      // Load the PDF bytes for pdf.js rendering
+      const base64 = await invoke<string>("read_file_base64", { path });
       setPdfPath(path);
+      setPdfBase64(base64);
       setPdfName(fileInfo.name);
       setPageCount(info.page_count);
       setCurrentPage(1);
-      await renderPage(path, 1);
+      await renderPage(base64, 1);
     } catch (err) {
       toast.error(String(err));
     }
-  }, []);
-
-  const renderPage = async (path: string, page: number) => {
-    try {
-      const base64 = await invoke<string>("render_pdf_page", { path, pageNumber: page });
-      setPageImageBase64(base64);
-    } catch {
-      setPageImageBase64(null);
-    }
-  };
+  }, [renderPage]);
 
   const goToPage = async (page: number) => {
-    if (!pdfPath || page < 1 || page > pageCount) return;
+    if (!pdfBase64 || page < 1 || page > pageCount) return;
     setCurrentPage(page);
-    await renderPage(pdfPath, page);
+    await renderPage(pdfBase64, page);
   };
 
   // Drawing handlers
@@ -216,8 +223,13 @@ export function PdfSignaturePage() {
               </Button>
             </div>
             <div className="flex-1 overflow-auto rounded-lg border bg-white min-h-0">
-              {pageImageBase64 ? (
-                <img src={`data:image/png;base64,${pageImageBase64}`} alt="PDF page" className="max-w-full" />
+              {loadingPage ? (
+                <div className="flex h-full items-center justify-center text-muted-foreground">
+                  <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                  {t("common.loading")}
+                </div>
+              ) : pageImageSrc ? (
+                <img src={pageImageSrc} alt="PDF page" className="max-w-full" />
               ) : (
                 <div className="flex h-full items-center justify-center text-muted-foreground">
                   {t("common.loading")}

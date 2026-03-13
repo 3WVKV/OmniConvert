@@ -25,7 +25,7 @@ function App() {
       <main className="flex-1 overflow-hidden">
         <Page />
       </main>
-      <Toaster position="bottom-right" richColors />
+      <Toaster position="top-right" richColors />
     </div>
   );
 }

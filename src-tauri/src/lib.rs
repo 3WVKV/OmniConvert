@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::ImageFormat;
+use lopdf::Object;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -40,7 +41,6 @@ struct OcrResult {
 // ─── Helper: find ffmpeg ───────────────────────────────────────────
 
 fn find_ffmpeg() -> String {
-    // Check bundled binaries first, then PATH
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -59,7 +59,6 @@ fn find_ffmpeg() -> String {
 }
 
 fn find_tesseract() -> String {
-    // Common Windows install paths
     let paths = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
@@ -95,7 +94,6 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
         _ => return Err(format!("Unsupported output image format: {}", out_ext)),
     };
 
-    // For JPEG, use quality parameter
     if matches!(format, ImageFormat::Jpeg) {
         let mut buf = std::io::BufWriter::new(
             fs::File::create(output).map_err(|e| format!("Cannot create output: {}", e))?,
@@ -151,18 +149,11 @@ fn convert_data(input: &str, output: &str) -> Result<String, String> {
             }
             serde_json::Value::Array(rows)
         }
-        "xml" => {
-            // Simple XML text → wrap in JSON
-            serde_json::Value::String(content)
-        }
-        "yaml" | "yml" => {
-            // Simple: treat as text pass-through for now
-            serde_json::Value::String(content)
-        }
+        "xml" => serde_json::Value::String(content),
+        "yaml" | "yml" => serde_json::Value::String(content),
         _ => return Err(format!("Unsupported input data format: {}", in_ext)),
     };
 
-    // Write to target format
     let output_content = match out_ext.as_str() {
         "json" => serde_json::to_string_pretty(&data).map_err(|e| format!("JSON write: {}", e))?,
         "csv" => {
@@ -217,7 +208,18 @@ fn convert_text(input: &str, output: &str) -> Result<String, String> {
     let out_ext = Path::new(output).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
     let result = match (in_ext.as_str(), out_ext.as_str()) {
-        ("md", "html") => format!("<html><body><pre>{}</pre></body></html>", content),
+        ("md", "html") | ("txt", "html") => {
+            // Wrap in proper HTML so the file renders correctly in a browser
+            let escaped = content
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            format!(
+                "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<pre>{}</pre>\n</body>\n</html>",
+                Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document"),
+                escaped
+            )
+        }
         ("html", "txt") | ("html", "md") => {
             // Strip HTML tags (basic)
             let re_tags = content
@@ -235,12 +237,93 @@ fn convert_text(input: &str, output: &str) -> Result<String, String> {
             }
             result
         }
-        ("md", "txt") | ("txt", "md") | ("txt", "html") | ("rtf", "txt") => content,
+        ("txt", "md") => content,
+        ("md", "txt") => content,
+        ("rtf", "txt") => content,
+        ("docx", "txt") => extract_docx_text(input)?,
+        ("docx", "html") => {
+            let text = extract_docx_text(input)?;
+            let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            format!(
+                "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<pre>{}</pre>\n</body>\n</html>",
+                Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document"),
+                escaped
+            )
+        }
+        ("docx", "md") => extract_docx_text(input)?,
         _ => content,
     };
 
-    fs::write(output, result).map_err(|e| format!("Write error: {}", e))?;
+    fs::write(output, &result).map_err(|e| format!("Write error: {}", e))?;
     Ok(output.to_string())
+}
+
+/// Extract plain text from a .docx file (which is a ZIP with word/document.xml)
+fn extract_docx_text(path: &str) -> Result<String, String> {
+    let file = fs::File::open(path).map_err(|e| format!("Open error: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+
+    let mut xml = String::new();
+    {
+        let mut doc_file = archive
+            .by_name("word/document.xml")
+            .map_err(|_| "Not a valid .docx file (missing word/document.xml)".to_string())?;
+        std::io::Read::read_to_string(&mut doc_file, &mut xml)
+            .map_err(|e| format!("Read error: {}", e))?;
+    }
+
+    // Strip XML tags and extract text content
+    let mut text = String::new();
+    let mut in_tag = false;
+    let mut last_was_para = false;
+    let chars: Vec<char> = xml.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            // Check for paragraph end: </w:p>
+            let rest: String = chars[i..std::cmp::min(i + 10, chars.len())].iter().collect();
+            if rest.starts_with("</w:p>") && !last_was_para {
+                text.push('\n');
+                last_was_para = true;
+            }
+            in_tag = true;
+        } else if chars[i] == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            text.push(chars[i]);
+            last_was_para = false;
+        }
+        i += 1;
+    }
+
+    Ok(text.trim().to_string())
+}
+
+// ─── PDF helpers ───────────────────────────────────────────────────
+
+/// Remap all object references within an Object by adding an offset to IDs
+fn remap_refs(obj: &Object, offset: u32) -> Object {
+    match obj {
+        Object::Reference(id) => Object::Reference((id.0 + offset, id.1)),
+        Object::Array(arr) => {
+            Object::Array(arr.iter().map(|o| remap_refs(o, offset)).collect())
+        }
+        Object::Dictionary(dict) => {
+            let mut new_dict = lopdf::Dictionary::new();
+            for (key, value) in dict.iter() {
+                new_dict.set(key.clone(), remap_refs(value, offset));
+            }
+            Object::Dictionary(new_dict)
+        }
+        Object::Stream(stream) => {
+            let mut new_dict = lopdf::Dictionary::new();
+            for (key, value) in stream.dict.iter() {
+                new_dict.set(key.clone(), remap_refs(value, offset));
+            }
+            Object::Stream(lopdf::Stream::new(new_dict, stream.content.clone()))
+        }
+        other => other.clone(),
+    }
 }
 
 // ─── Tauri Commands ────────────────────────────────────────────────
@@ -265,7 +348,7 @@ fn convert_file(
         "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "opus" => "audio",
         "mp4" | "mov" | "mkv" | "avi" | "webm" | "flv" | "mpeg" | "mpg" => "video",
         "csv" | "json" | "xml" | "yaml" | "yml" | "xls" | "xlsx" | "ods" => "data",
-        "txt" | "md" | "html" | "rtf" => "text",
+        "txt" | "md" | "html" | "rtf" | "docx" => "text",
         "zip" | "rar" | "7z" | "tar" | "gz" => "archive",
         _ => "unknown",
     };
@@ -288,7 +371,7 @@ fn convert_file(
             let output = cmd
                 .arg(&output_path)
                 .output()
-                .map_err(|e| format!("ffmpeg error: {}. Make sure ffmpeg is installed.", e))?;
+                .map_err(|e| format!("ffmpeg error: {}. Make sure ffmpeg is installed and in PATH.", e))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -316,10 +399,11 @@ fn get_pdf_info(path: String) -> Result<PdfInfo, String> {
     })
 }
 
+/// Returns the raw PDF file as base64 so the frontend can render it with pdf.js
 #[tauri::command]
-fn render_pdf_page(_path: String, _page_number: u32) -> Result<String, String> {
-    // PDF rendering is delegated to frontend pdfjs
-    Err("PDF rendering delegated to frontend pdfjs".to_string())
+fn render_pdf_page(path: String, _page_number: u32) -> Result<String, String> {
+    let bytes = fs::read(&path).map_err(|e| format!("Read error: {}", e))?;
+    Ok(STANDARD.encode(&bytes))
 }
 
 #[tauri::command]
@@ -328,7 +412,6 @@ fn merge_pdfs(input_paths: Vec<String>, output_path: String) -> Result<String, S
         return Err("Need at least 2 PDFs to merge".to_string());
     }
 
-    // Load all documents
     let mut documents: Vec<lopdf::Document> = Vec::new();
     for path in &input_paths {
         let doc = lopdf::Document::load(path)
@@ -336,49 +419,58 @@ fn merge_pdfs(input_paths: Vec<String>, output_path: String) -> Result<String, S
         documents.push(doc);
     }
 
-    // Use a simpler approach: collect all page contents and rebuild
-    // For a robust merge, we concatenate by copying page tree entries
     let mut base_doc = documents.remove(0);
 
+    // Get the base doc's Pages object ID
+    let base_pages_id = {
+        let catalog = base_doc.catalog().map_err(|e| format!("Catalog error: {}", e))?;
+        match catalog.get(b"Pages").map_err(|e| format!("Pages ref error: {}", e))? {
+            Object::Reference(id) => *id,
+            _ => return Err("Invalid Pages reference in base PDF".to_string()),
+        }
+    };
+
     for other_doc in documents {
-        let max_id = base_doc.max_id;
+        let id_offset = base_doc.max_id;
         let other_page_ids: Vec<lopdf::ObjectId> = other_doc.get_pages().values().cloned().collect();
 
-        // Copy all objects with offset IDs
-        for (id, object) in &other_doc.objects {
-            let new_id = (id.0 + max_id, id.1);
-            base_doc.objects.insert(new_id, object.clone());
+        // Copy all objects from other doc with remapped IDs and internal references
+        for (old_id, object) in &other_doc.objects {
+            let new_id = (old_id.0 + id_offset, old_id.1);
+            let remapped = remap_refs(object, id_offset);
+            base_doc.objects.insert(new_id, remapped);
         }
 
-        // Find the Pages dictionary in the base document
-        if let Ok(catalog) = base_doc.catalog() {
-            if let Ok(pages_ref) = catalog.get(b"Pages") {
-                if let lopdf::Object::Reference(pages_id) = pages_ref {
-                    let pages_id = *pages_id;
-                    if let Ok(pages_obj) = base_doc.get_object_mut(pages_id) {
-                        if let lopdf::Object::Dictionary(ref mut pages_dict) = pages_obj {
-                            // Add new page references
-                            if let Ok(kids) = pages_dict.get_mut(b"Kids") {
-                                if let lopdf::Object::Array(ref mut kids_arr) = kids {
-                                    for page_id in &other_page_ids {
-                                        let new_id = (page_id.0 + max_id, page_id.1);
-                                        kids_arr.push(lopdf::Object::Reference(new_id));
-                                    }
-                                }
-                            }
-                            // Update count
-                            let current_count = pages_dict
-                                .get(b"Count")
-                                .ok()
-                                .and_then(|c| {
-                                    if let lopdf::Object::Integer(n) = c { Some(*n) } else { None }
-                                })
-                                .unwrap_or(0);
-                            let added = other_page_ids.len() as i64;
-                            pages_dict.set("Count", lopdf::Object::Integer(current_count + added));
+        // Update each copied page's Parent to point to base_pages_id
+        for page_id in &other_page_ids {
+            let new_page_id = (page_id.0 + id_offset, page_id.1);
+            if let Ok(page_obj) = base_doc.get_object_mut(new_page_id) {
+                if let Object::Dictionary(ref mut dict) = page_obj {
+                    dict.set("Parent", Object::Reference(base_pages_id));
+                }
+            }
+        }
+
+        // Add new page references to base doc's Kids array and update Count
+        if let Ok(pages_obj) = base_doc.get_object_mut(base_pages_id) {
+            if let Object::Dictionary(ref mut pages_dict) = pages_obj {
+                if let Ok(kids) = pages_dict.get_mut(b"Kids") {
+                    if let Object::Array(ref mut kids_arr) = kids {
+                        for page_id in &other_page_ids {
+                            let new_id = (page_id.0 + id_offset, page_id.1);
+                            kids_arr.push(Object::Reference(new_id));
                         }
                     }
                 }
+                let current_count = pages_dict
+                    .get(b"Count")
+                    .ok()
+                    .and_then(|c| {
+                        if let Object::Integer(n) = c { Some(*n) } else { None }
+                    })
+                    .unwrap_or(0);
+                let added = other_page_ids.len() as i64;
+                pages_dict.set("Count", Object::Integer(current_count + added));
             }
         }
 
@@ -409,7 +501,6 @@ fn extract_pages_impl(input_path: &str, output_path: &str, pages: &[u32]) -> Res
     let all_pages: Vec<u32> = doc.get_pages().keys().cloned().collect();
 
     let mut new_doc = doc.clone();
-    // Delete pages not in the requested set (in reverse order to preserve indices)
     let mut to_delete: Vec<u32> = all_pages
         .iter()
         .filter(|p| !pages.contains(p))
@@ -445,8 +536,8 @@ fn rotate_pdf(
     for (page_num, page_id) in &page_ids {
         if pages.contains(page_num) {
             if let Ok(page) = doc.get_object_mut(*page_id) {
-                if let lopdf::Object::Dictionary(ref mut dict) = page {
-                    dict.set("Rotate", lopdf::Object::Integer(degrees as i64));
+                if let Object::Dictionary(ref mut dict) = page {
+                    dict.set("Rotate", Object::Integer(degrees as i64));
                 }
             }
         }
@@ -479,10 +570,7 @@ fn compress_pdf(input_path: String, output_path: String, _quality: String) -> Re
 
 #[tauri::command]
 fn pdf_to_images(_input_path: String, output_dir: String) -> Result<String, String> {
-    // Create output directory
     fs::create_dir_all(&output_dir).map_err(|e| format!("Dir error: {}", e))?;
-
-    // Use external tool (pdftoppm / magick) or delegate to frontend
     Err("PDF to images: install poppler-utils (pdftoppm) for this feature".to_string())
 }
 
@@ -508,15 +596,117 @@ fn pdf_to_text(input_path: String, output_path: String) -> Result<String, String
 fn apply_signature(
     input_path: String,
     output_path: String,
-    _placement: SignaturePlacement,
+    placement: SignaturePlacement,
 ) -> Result<String, String> {
-    // For a proper implementation, we'd embed the signature image into the PDF
-    // Using lopdf to add an image XObject is complex; for now, copy and note placement
     let mut doc = lopdf::Document::load(&input_path)
         .map_err(|e| format!("PDF load error: {}", e))?;
 
-    // Simple approach: add a text annotation with the signature info
-    // Full image embedding would require XObject stream manipulation
+    // Decode the base64 signature image
+    let img_data = if placement.signature_image_base64.contains(",") {
+        // data:image/png;base64,<data>
+        let parts: Vec<&str> = placement.signature_image_base64.splitn(2, ',').collect();
+        STANDARD.decode(parts.get(1).unwrap_or(&""))
+            .map_err(|e| format!("Base64 decode error: {}", e))?
+    } else {
+        STANDARD.decode(&placement.signature_image_base64)
+            .map_err(|e| format!("Base64 decode error: {}", e))?
+    };
+
+    // Decode PNG to raw RGB pixels using the image crate
+    let img = image::load_from_memory(&img_data)
+        .map_err(|e| format!("Image decode error: {}", e))?;
+    let rgb_img = img.to_rgb8();
+    let (img_w, img_h) = rgb_img.dimensions();
+    let raw_pixels = rgb_img.into_raw();
+
+    // Create an Image XObject stream
+    let mut img_dict = lopdf::Dictionary::new();
+    img_dict.set("Type", Object::Name(b"XObject".to_vec()));
+    img_dict.set("Subtype", Object::Name(b"Image".to_vec()));
+    img_dict.set("Width", Object::Integer(img_w as i64));
+    img_dict.set("Height", Object::Integer(img_h as i64));
+    img_dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+    img_dict.set("BitsPerComponent", Object::Integer(8));
+
+    let img_stream = lopdf::Stream::new(img_dict, raw_pixels);
+    let img_obj_id = doc.add_object(Object::Stream(img_stream));
+
+    // Get the target page
+    let pages = doc.get_pages();
+    let page_num = placement.page_index + 1;
+    let page_id = pages
+        .get(&page_num)
+        .cloned()
+        .ok_or_else(|| format!("Page {} not found", page_num))?;
+
+    // Add the image to the page's Resources/XObject dictionary
+    let sig_name = b"Sig0".to_vec();
+    if let Ok(page_obj) = doc.get_object_mut(page_id) {
+        if let Object::Dictionary(ref mut page_dict) = page_obj {
+            // Ensure Resources exists
+            let has_resources = page_dict.get(b"Resources").is_ok();
+            if !has_resources {
+                page_dict.set("Resources", Object::Dictionary(lopdf::Dictionary::new()));
+            }
+
+            if let Ok(Object::Dictionary(ref mut resources)) = page_dict.get_mut(b"Resources") {
+                // Ensure XObject sub-dict exists
+                let has_xobject = resources.get(b"XObject").is_ok();
+                if !has_xobject {
+                    resources.set("XObject", Object::Dictionary(lopdf::Dictionary::new()));
+                }
+                if let Ok(Object::Dictionary(ref mut xobjects)) = resources.get_mut(b"XObject") {
+                    xobjects.set(sig_name.clone(), Object::Reference(img_obj_id));
+                }
+            }
+        }
+    }
+
+    // Build content stream to draw the signature image
+    let x = placement.x;
+    let y = placement.y;
+    let w = placement.width;
+    let h = placement.height;
+    let mut draw_ops = format!(
+        "\nq\n{} 0 0 {} {} {} cm\n/{} Do\nQ\n",
+        w, h, x, y,
+        String::from_utf8_lossy(&sig_name)
+    );
+
+    // Optionally draw date text
+    if let Some(ref date_text) = placement.date_text {
+        let dx = placement.date_x.unwrap_or(x);
+        let dy = placement.date_y.unwrap_or(y - 15.0);
+        draw_ops.push_str(&format!(
+            "q\nBT\n/Helvetica 10 Tf\n{} {} Td\n({}) Tj\nET\nQ\n",
+            dx, dy, date_text
+        ));
+    }
+
+    // Append the drawing operations to the page's content stream
+    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        lopdf::Dictionary::new(),
+        draw_ops.into_bytes(),
+    )));
+
+    // Get current Contents and make it an array including our new stream
+    if let Ok(page_obj) = doc.get_object_mut(page_id) {
+        if let Object::Dictionary(ref mut page_dict) = page_obj {
+            let existing_contents = page_dict.get(b"Contents").ok().cloned();
+            let new_contents = match existing_contents {
+                Some(Object::Reference(ref_id)) => {
+                    Object::Array(vec![Object::Reference(ref_id), Object::Reference(content_id)])
+                }
+                Some(Object::Array(mut arr)) => {
+                    arr.push(Object::Reference(content_id));
+                    Object::Array(arr)
+                }
+                _ => Object::Reference(content_id),
+            };
+            page_dict.set("Contents", new_contents);
+        }
+    }
+
     doc.save(&output_path)
         .map_err(|e| format!("Save error: {}", e))?;
 
@@ -556,6 +746,21 @@ fn write_text_file(path: String, content: String) -> Result<String, String> {
 #[tauri::command]
 fn ocr_extract(path: String, language: String) -> Result<OcrResult, String> {
     let tesseract = find_tesseract();
+
+    // Check if tesseract exists before trying
+    let check = Command::new(&tesseract)
+        .arg("--version")
+        .output();
+
+    if check.is_err() {
+        return Err(
+            "Tesseract OCR is not installed.\n\
+             Install it from: https://github.com/UB-Mannheim/tesseract/wiki\n\
+             After installation, restart the application."
+                .to_string(),
+        );
+    }
+
     let output = Command::new(&tesseract)
         .arg(&path)
         .arg("stdout")

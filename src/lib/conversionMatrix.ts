@@ -18,6 +18,8 @@ export const conversionMatrix: Record<string, string[]> = {
   html: ["txt", "md"],
   txt: ["md", "html"],
   rtf: ["txt"],
+  docx: ["txt", "html", "md"],
+  doc: ["txt"],
 
   // Data
   csv: ["json", "xml", "yaml", "xlsx"],

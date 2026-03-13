@@ -7,7 +7,7 @@ import { DropZone } from "@/components/shared/DropZone";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
-import { FileText, GripVertical, X, Merge, Loader2 } from "lucide-react";
+import { FileText, ChevronUp, ChevronDown, X, Merge, Loader2 } from "lucide-react";
 import type { PdfDocument } from "@/types/pdf";
 import { toast } from "sonner";
 
@@ -18,7 +18,6 @@ export function PdfMergePage() {
     reorderPdfMergeFiles, clearPdfMergeFiles,
   } = useAppStore();
   const [merging, setMerging] = useState(false);
-  const [dragIdx, setDragIdx] = useState<number | null>(null);
 
   const handlePaths = useCallback(async (paths: string[]) => {
     const pdfPaths = paths.filter((p) => p.toLowerCase().endsWith(".pdf"));
@@ -50,16 +49,13 @@ export function PdfMergePage() {
     addPdfMergeFiles(docs);
   }, [addPdfMergeFiles]);
 
-  const handleDragStart = (idx: number) => setDragIdx(idx);
-
-  const handleDragOver = (e: React.DragEvent, idx: number) => {
-    e.preventDefault();
-    if (dragIdx === null || dragIdx === idx) return;
+  const moveItem = (idx: number, direction: -1 | 1) => {
+    const newIdx = idx + direction;
+    if (newIdx < 0 || newIdx >= pdfMergeFiles.length) return;
     const items = [...pdfMergeFiles];
-    const [moved] = items.splice(dragIdx, 1);
-    items.splice(idx, 0, moved);
+    const [moved] = items.splice(idx, 1);
+    items.splice(newIdx, 0, moved);
     reorderPdfMergeFiles(items);
-    setDragIdx(idx);
   };
 
   const handleMerge = async () => {
@@ -115,15 +111,28 @@ export function PdfMergePage() {
               {pdfMergeFiles.map((doc, idx) => (
                 <div
                   key={doc.id}
-                  draggable
-                  onDragStart={() => handleDragStart(idx)}
-                  onDragOver={(e) => handleDragOver(e, idx)}
-                  onDragEnd={() => setDragIdx(null)}
-                  className={`flex items-center gap-3 rounded-lg border bg-card p-3 cursor-grab active:cursor-grabbing transition-colors ${
-                    dragIdx === idx ? "border-primary bg-primary/5" : ""
-                  }`}
+                  className="flex items-center gap-3 rounded-lg border bg-card p-3 transition-colors"
                 >
-                  <GripVertical className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div className="flex flex-col gap-0.5">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-5 w-5"
+                      disabled={idx === 0}
+                      onClick={() => moveItem(idx, -1)}
+                    >
+                      <ChevronUp className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-5 w-5"
+                      disabled={idx === pdfMergeFiles.length - 1}
+                      onClick={() => moveItem(idx, 1)}
+                    >
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
                   <div className="flex h-10 w-10 items-center justify-center rounded-md bg-muted">
                     <FileText className="h-5 w-5 text-muted-foreground" />
                   </div>
