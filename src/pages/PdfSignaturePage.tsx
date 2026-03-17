@@ -12,11 +12,19 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import {
   PenTool, Type, ImageIcon, Save, Trash2, ChevronLeft, ChevronRight,
-  CalendarDays, Loader2, Download,
+  CalendarDays, Loader2, Download, X,
 } from "lucide-react";
 import type { SignatureMode, SavedSignature, SignaturePlacement } from "@/types/pdf";
 import { renderPdfPageToBase64 } from "@/lib/pdfRenderer";
 import { toast } from "sonner";
+
+interface SigOverlay {
+  // Position as fraction (0-1) of the preview container
+  xFrac: number;
+  yFrac: number;
+  wFrac: number;
+  hFrac: number;
+}
 
 export function PdfSignaturePage() {
   const { t } = useTranslation();
@@ -40,6 +48,16 @@ export function PdfSignaturePage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [drawing, setDrawing] = useState(false);
 
+  // Signature overlay on the PDF preview
+  const [sigOverlay, setSigOverlay] = useState<SigOverlay | null>(null);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+  const dragState = useRef<{
+    type: "move" | "resize";
+    startX: number;
+    startY: number;
+    startOverlay: SigOverlay;
+  } | null>(null);
+
   const renderPage = useCallback(async (base64: string, page: number) => {
     setLoadingPage(true);
     try {
@@ -57,23 +75,86 @@ export function PdfSignaturePage() {
     try {
       const fileInfo = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
       const info = await invoke<{ page_count: number }>("get_pdf_info", { path });
-      // Load the PDF bytes for pdf.js rendering
       const base64 = await invoke<string>("read_file_base64", { path });
       setPdfPath(path);
       setPdfBase64(base64);
       setPdfName(fileInfo.name);
       setPageCount(info.page_count);
       setCurrentPage(1);
+      setSigOverlay(null);
       await renderPage(base64, 1);
     } catch (err) {
       toast.error(String(err));
     }
   }, [renderPage]);
 
+  const closePdf = () => {
+    setPdfPath(null);
+    setPdfBase64(null);
+    setPageImageSrc(null);
+    setSigOverlay(null);
+  };
+
   const goToPage = async (page: number) => {
     if (!pdfBase64 || page < 1 || page > pageCount) return;
     setCurrentPage(page);
     await renderPage(pdfBase64, page);
+  };
+
+  // Place signature overlay on the preview when a signature is selected
+  const placeSignatureOnPreview = () => {
+    if (!signatureImage) return;
+    // Default: center of page, 25% width, 8% height
+    setSigOverlay({
+      xFrac: 0.375,
+      yFrac: 0.46,
+      wFrac: 0.25,
+      hFrac: 0.08,
+    });
+  };
+
+  // Mouse handlers for drag & resize
+  const handleOverlayMouseDown = (e: React.MouseEvent, type: "move" | "resize") => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!sigOverlay) return;
+    dragState.current = {
+      type,
+      startX: e.clientX,
+      startY: e.clientY,
+      startOverlay: { ...sigOverlay },
+    };
+
+    const handleMouseMove = (ev: MouseEvent) => {
+      if (!dragState.current || !previewContainerRef.current) return;
+      const container = previewContainerRef.current;
+      const rect = container.getBoundingClientRect();
+      const dx = (ev.clientX - dragState.current.startX) / rect.width;
+      const dy = (ev.clientY - dragState.current.startY) / rect.height;
+      const s = dragState.current.startOverlay;
+
+      if (dragState.current.type === "move") {
+        setSigOverlay({
+          ...s,
+          xFrac: Math.max(0, Math.min(1 - s.wFrac, s.xFrac + dx)),
+          yFrac: Math.max(0, Math.min(1 - s.hFrac, s.yFrac + dy)),
+        });
+      } else {
+        // Resize from bottom-right corner
+        const newW = Math.max(0.05, Math.min(1 - s.xFrac, s.wFrac + dx));
+        const newH = Math.max(0.03, Math.min(1 - s.yFrac, s.hFrac + dy));
+        setSigOverlay({ ...s, wFrac: newW, hFrac: newH });
+      }
+    };
+
+    const handleMouseUp = () => {
+      dragState.current = null;
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
   };
 
   // Drawing handlers
@@ -117,6 +198,7 @@ export function PdfSignaturePage() {
       ctx?.clearRect(0, 0, canvas.width, canvas.height);
     }
     setSignatureImage(null);
+    setSigOverlay(null);
   };
 
   // Type signature → canvas
@@ -158,7 +240,7 @@ export function PdfSignaturePage() {
   };
 
   const handleApplySignature = async () => {
-    if (!pdfPath || !signatureImage) return;
+    if (!pdfPath || !signatureImage || !sigOverlay) return;
     setSaving(true);
     try {
       const outputPath = await save({
@@ -170,13 +252,11 @@ export function PdfSignaturePage() {
       const placement: SignaturePlacement = {
         signatureImageBase64: signatureImage,
         pageIndex: currentPage - 1,
-        x: 350,
-        y: 700,
-        width: 200,
-        height: 60,
+        xFraction: sigOverlay.xFrac,
+        yFraction: sigOverlay.yFrac,
+        widthFraction: sigOverlay.wFrac,
+        heightFraction: sigOverlay.hFrac,
         dateText: addDate ? new Date().toLocaleDateString() : undefined,
-        dateX: addDate ? 350 : undefined,
-        dateY: addDate ? 770 : undefined,
       };
 
       await invoke("apply_signature", {
@@ -209,7 +289,7 @@ export function PdfSignaturePage() {
         />
       ) : (
         <div className="flex flex-1 gap-4 min-h-0">
-          {/* PDF Preview */}
+          {/* PDF Preview with signature overlay */}
           <div className="flex flex-1 flex-col items-center gap-2 min-h-0">
             <div className="flex items-center gap-2">
               <Button variant="ghost" size="icon" onClick={() => goToPage(currentPage - 1)} disabled={currentPage <= 1}>
@@ -221,15 +301,53 @@ export function PdfSignaturePage() {
               <Button variant="ghost" size="icon" onClick={() => goToPage(currentPage + 1)} disabled={currentPage >= pageCount}>
                 <ChevronRight className="h-4 w-4" />
               </Button>
+              <Button variant="ghost" size="sm" onClick={closePdf}>
+                <X className="mr-1 h-4 w-4" />
+                {t("common.close")}
+              </Button>
             </div>
-            <div className="flex-1 overflow-auto rounded-lg border bg-white min-h-0">
+            <div className="flex-1 overflow-auto rounded-lg border bg-white min-h-0 w-full">
               {loadingPage ? (
                 <div className="flex h-full items-center justify-center text-muted-foreground">
                   <Loader2 className="mr-2 h-5 w-5 animate-spin" />
                   {t("common.loading")}
                 </div>
               ) : pageImageSrc ? (
-                <img src={pageImageSrc} alt="PDF page" className="max-w-full" />
+                <div ref={previewContainerRef} className="relative inline-block">
+                  <img src={pageImageSrc} alt="PDF page" className="max-w-full select-none" draggable={false} />
+                  {/* Signature overlay */}
+                  {sigOverlay && signatureImage && (
+                    <div
+                      className="absolute border-2 border-dashed border-blue-500 bg-blue-500/10 cursor-move"
+                      style={{
+                        left: `${sigOverlay.xFrac * 100}%`,
+                        top: `${sigOverlay.yFrac * 100}%`,
+                        width: `${sigOverlay.wFrac * 100}%`,
+                        height: `${sigOverlay.hFrac * 100}%`,
+                      }}
+                      onMouseDown={(e) => handleOverlayMouseDown(e, "move")}
+                    >
+                      <img
+                        src={signatureImage}
+                        alt="signature"
+                        className="h-full w-full object-contain pointer-events-none"
+                        draggable={false}
+                      />
+                      {/* Resize handle (bottom-right) */}
+                      <div
+                        className="absolute -bottom-1.5 -right-1.5 h-3 w-3 rounded-full bg-blue-600 cursor-se-resize"
+                        onMouseDown={(e) => handleOverlayMouseDown(e, "resize")}
+                      />
+                      {/* Remove overlay button */}
+                      <div
+                        className="absolute -top-2 -right-2 h-4 w-4 rounded-full bg-red-500 text-white flex items-center justify-center cursor-pointer text-xs leading-none"
+                        onClick={(e) => { e.stopPropagation(); setSigOverlay(null); }}
+                      >
+                        ×
+                      </div>
+                    </div>
+                  )}
+                </div>
               ) : (
                 <div className="flex h-full items-center justify-center text-muted-foreground">
                   {t("common.loading")}
@@ -239,7 +357,7 @@ export function PdfSignaturePage() {
           </div>
 
           {/* Signature panel */}
-          <div className="flex w-72 shrink-0 flex-col gap-3 rounded-lg border bg-card p-4">
+          <div className="flex w-72 shrink-0 flex-col gap-3 rounded-lg border bg-card p-4 overflow-y-auto">
             <Tabs value={signatureMode} onValueChange={(v) => setSignatureMode(v as SignatureMode)}>
               <TabsList className="w-full">
                 <TabsTrigger value="draw" className="flex-1">
@@ -290,6 +408,13 @@ export function PdfSignaturePage() {
                 )}
               </TabsContent>
             </Tabs>
+
+            {/* Place on PDF button */}
+            {signatureImage && !sigOverlay && (
+              <Button variant="outline" className="w-full" onClick={placeSignatureOnPreview}>
+                {t("pdfSignature.placeOnPage") || "Place on page"}
+              </Button>
+            )}
 
             <Separator />
 
@@ -363,7 +488,7 @@ export function PdfSignaturePage() {
             <div className="mt-auto">
               <Button
                 className="w-full"
-                disabled={!signatureImage || saving}
+                disabled={!signatureImage || !sigOverlay || saving}
                 onClick={handleApplySignature}
               >
                 {saving ? (

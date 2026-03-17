@@ -35,13 +35,15 @@ export interface CompressResult {
 export interface SignaturePlacement {
   signatureImageBase64: string;
   pageIndex: number;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+  /** Fraction (0-1) of page width for X position */
+  xFraction: number;
+  /** Fraction (0-1) of page height for Y position (from top) */
+  yFraction: number;
+  /** Fraction (0-1) of page width for signature width */
+  widthFraction: number;
+  /** Fraction (0-1) of page height for signature height */
+  heightFraction: number;
   dateText?: string;
-  dateX?: number;
-  dateY?: number;
 }
 
 export interface SavedSignature {

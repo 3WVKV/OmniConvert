@@ -1,25 +1,25 @@
 /** Maps source extension to list of valid target extensions */
 export const conversionMatrix: Record<string, string[]> = {
   // Images
-  jpg: ["png", "webp", "gif", "bmp", "tiff", "avif", "ico"],
-  jpeg: ["png", "webp", "gif", "bmp", "tiff", "avif", "ico"],
-  png: ["jpg", "webp", "gif", "bmp", "tiff", "avif", "ico"],
-  webp: ["jpg", "png", "gif", "bmp", "tiff", "avif", "ico"],
-  gif: ["jpg", "png", "webp", "bmp", "tiff", "avif"],
-  bmp: ["jpg", "png", "webp", "gif", "tiff", "avif", "ico"],
-  tiff: ["jpg", "png", "webp", "gif", "bmp", "avif"],
-  avif: ["jpg", "png", "webp", "gif", "bmp", "tiff"],
-  heic: ["jpg", "png", "webp", "gif", "bmp", "tiff", "avif"],
-  ico: ["png", "jpg", "webp", "bmp"],
-  svg: ["png", "jpg", "webp"],
+  jpg: ["png", "webp", "gif", "bmp", "tiff", "avif", "ico", "pdf"],
+  jpeg: ["png", "webp", "gif", "bmp", "tiff", "avif", "ico", "pdf"],
+  png: ["jpg", "webp", "gif", "bmp", "tiff", "avif", "ico", "pdf"],
+  webp: ["jpg", "png", "gif", "bmp", "tiff", "avif", "ico", "pdf"],
+  gif: ["jpg", "png", "webp", "bmp", "tiff", "avif", "pdf"],
+  bmp: ["jpg", "png", "webp", "gif", "tiff", "avif", "ico", "pdf"],
+  tiff: ["jpg", "png", "webp", "gif", "bmp", "avif", "pdf"],
+  avif: ["jpg", "png", "webp", "gif", "bmp", "tiff", "pdf"],
+  heic: ["jpg", "png", "webp", "gif", "bmp", "tiff", "avif", "pdf"],
+  ico: ["png", "jpg", "webp", "bmp", "pdf"],
+  svg: ["png", "jpg", "webp", "pdf"],
 
   // Documents
-  md: ["html", "txt"],
-  html: ["txt", "md"],
-  txt: ["md", "html"],
-  rtf: ["txt"],
-  docx: ["txt", "html", "md"],
-  doc: ["txt"],
+  md: ["html", "txt", "pdf"],
+  html: ["txt", "md", "pdf"],
+  txt: ["md", "html", "pdf"],
+  rtf: ["txt", "pdf"],
+  docx: ["txt", "html", "md", "pdf"],
+  doc: ["txt", "pdf"],
 
   // Data
   csv: ["json", "xml", "yaml", "xlsx"],

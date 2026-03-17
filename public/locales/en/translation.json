@@ -54,7 +54,8 @@
     "page": "Page",
     "of": "of",
     "signatureName": "Signature name",
-    "typeName": "Type your name"
+    "typeName": "Type your name",
+    "placeOnPage": "Place on page"
   },
   "pdfToolkit": {
     "title": "PDF Toolkit",

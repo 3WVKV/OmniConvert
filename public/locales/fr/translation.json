@@ -54,7 +54,8 @@
     "page": "Page",
     "of": "sur",
     "signatureName": "Nom de la signature",
-    "typeName": "Tapez votre nom"
+    "typeName": "Tapez votre nom",
+    "placeOnPage": "Placer sur la page"
   },
   "pdfToolkit": {
     "title": "Outils PDF",

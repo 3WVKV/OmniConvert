@@ -20,16 +20,20 @@ struct SignaturePlacement {
     signature_image_base64: String,
     #[serde(rename = "pageIndex")]
     page_index: u32,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+    /// Fraction (0-1) of page width for X position
+    #[serde(rename = "xFraction")]
+    x_fraction: f64,
+    /// Fraction (0-1) of page height for Y position (from top)
+    #[serde(rename = "yFraction")]
+    y_fraction: f64,
+    /// Fraction (0-1) of page width for signature width
+    #[serde(rename = "widthFraction")]
+    width_fraction: f64,
+    /// Fraction (0-1) of page height for signature height
+    #[serde(rename = "heightFraction")]
+    height_fraction: f64,
     #[serde(rename = "dateText")]
     date_text: Option<String>,
-    #[serde(rename = "dateX")]
-    date_x: Option<f64>,
-    #[serde(rename = "dateY")]
-    date_y: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -326,6 +330,229 @@ fn remap_refs(obj: &Object, offset: u32) -> Object {
     }
 }
 
+// ─── Convert to PDF ─────────────────────────────────────────────────
+
+fn convert_to_pdf(input: &str, output: &str) -> Result<String, String> {
+    let in_ext = Path::new(input)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match in_ext.as_str() {
+        // Image → PDF: embed the image as a full-page PDF
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tiff" | "tif" | "avif" | "ico" | "svg" => {
+            let img = image::open(input).map_err(|e| format!("Failed to open image: {}", e))?;
+            let rgb_img = img.to_rgb8();
+            let (img_w, img_h) = rgb_img.dimensions();
+
+            // Create a PDF page sized to the image (1 pixel = 1 point, capped at reasonable size)
+            let scale = if img_w > 2000 || img_h > 2000 {
+                2000.0 / (img_w.max(img_h) as f64)
+            } else {
+                1.0
+            };
+            let page_w = (img_w as f64 * scale) as i64;
+            let page_h = (img_h as f64 * scale) as i64;
+
+            let mut doc = lopdf::Document::with_version("1.5");
+
+            // Create image XObject
+            let mut img_dict = lopdf::Dictionary::new();
+            img_dict.set("Type", Object::Name(b"XObject".to_vec()));
+            img_dict.set("Subtype", Object::Name(b"Image".to_vec()));
+            img_dict.set("Width", Object::Integer(img_w as i64));
+            img_dict.set("Height", Object::Integer(img_h as i64));
+            img_dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+            img_dict.set("BitsPerComponent", Object::Integer(8));
+            let pixels: Vec<u8> = rgb_img.into_raw();
+            let img_id = doc.add_object(Object::Stream(lopdf::Stream::new(img_dict, pixels)));
+
+            // Resources dict
+            let mut xobjects = lopdf::Dictionary::new();
+            xobjects.set("Img0", Object::Reference(img_id));
+            let mut resources = lopdf::Dictionary::new();
+            resources.set("XObject", Object::Dictionary(xobjects));
+            let resources_id = doc.add_object(Object::Dictionary(resources));
+
+            // Content stream: draw image full-page
+            let content = format!("q\n{} 0 0 {} 0 0 cm\n/Img0 Do\nQ\n", page_w, page_h);
+            let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                lopdf::Dictionary::new(),
+                content.into_bytes(),
+            )));
+
+            // Page
+            let mut page_dict = lopdf::Dictionary::new();
+            page_dict.set("Type", Object::Name(b"Page".to_vec()));
+            page_dict.set(
+                "MediaBox",
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(page_w),
+                    Object::Integer(page_h),
+                ]),
+            );
+            page_dict.set("Resources", Object::Reference(resources_id));
+            page_dict.set("Contents", Object::Reference(content_id));
+            let page_id = doc.add_object(Object::Dictionary(page_dict));
+
+            // Pages
+            let mut pages_dict = lopdf::Dictionary::new();
+            pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
+            pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+            pages_dict.set("Count", Object::Integer(1));
+            let pages_id = doc.add_object(Object::Dictionary(pages_dict));
+
+            // Update page Parent
+            if let Ok(page_obj) = doc.get_object_mut(page_id) {
+                if let Object::Dictionary(ref mut dict) = page_obj {
+                    dict.set("Parent", Object::Reference(pages_id));
+                }
+            }
+
+            // Catalog
+            let mut catalog = lopdf::Dictionary::new();
+            catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+            catalog.set("Pages", Object::Reference(pages_id));
+            let catalog_id = doc.add_object(Object::Dictionary(catalog));
+
+            doc.trailer.set("Root", Object::Reference(catalog_id));
+
+            doc.save(output).map_err(|e| format!("PDF save error: {}", e))?;
+            Ok(output.to_string())
+        }
+        // Text/doc → PDF: create a simple text PDF
+        "txt" | "md" | "html" | "rtf" | "docx" | "doc" => {
+            let text = if in_ext == "docx" {
+                extract_docx_text(input)?
+            } else {
+                fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?
+            };
+
+            // Strip HTML tags for html input
+            let plain_text = if in_ext == "html" {
+                let mut result = String::new();
+                let mut in_tag = false;
+                for ch in text.chars() {
+                    if ch == '<' { in_tag = true; continue; }
+                    if ch == '>' { in_tag = false; continue; }
+                    if !in_tag { result.push(ch); }
+                }
+                result
+            } else {
+                text
+            };
+
+            // Create a simple text PDF
+            let mut doc = lopdf::Document::with_version("1.5");
+
+            // Split text into lines and pages (roughly 50 lines per page at 12pt)
+            let lines: Vec<&str> = plain_text.lines().collect();
+            let lines_per_page = 50;
+            let page_w: i64 = 612; // US Letter
+            let page_h: i64 = 792;
+            let margin = 50.0;
+            let line_height = 14.0;
+            let font_size = 11.0;
+
+            let mut page_ids: Vec<lopdf::ObjectId> = Vec::new();
+
+            for chunk in lines.chunks(lines_per_page) {
+                let mut content = String::new();
+                content.push_str(&format!("BT\n/F1 {} Tf\n", font_size));
+                content.push_str(&format!("{} {} Td\n", margin, page_h as f64 - margin));
+                for line in chunk {
+                    // Escape PDF special chars
+                    let escaped = line
+                        .replace('\\', "\\\\")
+                        .replace('(', "\\(")
+                        .replace(')', "\\)");
+                    content.push_str(&format!("({}) Tj\n0 -{} Td\n", escaped, line_height));
+                }
+                content.push_str("ET\n");
+
+                let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                    lopdf::Dictionary::new(),
+                    content.into_bytes(),
+                )));
+
+                // Font resource
+                let mut font_dict = lopdf::Dictionary::new();
+                font_dict.set("Type", Object::Name(b"Font".to_vec()));
+                font_dict.set("Subtype", Object::Name(b"Type1".to_vec()));
+                font_dict.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+                let mut fonts = lopdf::Dictionary::new();
+                fonts.set("F1", Object::Dictionary(font_dict));
+                let mut resources = lopdf::Dictionary::new();
+                resources.set("Font", Object::Dictionary(fonts));
+                let resources_id = doc.add_object(Object::Dictionary(resources));
+
+                let mut page_dict = lopdf::Dictionary::new();
+                page_dict.set("Type", Object::Name(b"Page".to_vec()));
+                page_dict.set(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(page_w),
+                        Object::Integer(page_h),
+                    ]),
+                );
+                page_dict.set("Resources", Object::Reference(resources_id));
+                page_dict.set("Contents", Object::Reference(content_id));
+                page_ids.push(doc.add_object(Object::Dictionary(page_dict)));
+            }
+
+            // If empty text, create at least one blank page
+            if page_ids.is_empty() {
+                let mut page_dict = lopdf::Dictionary::new();
+                page_dict.set("Type", Object::Name(b"Page".to_vec()));
+                page_dict.set(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(page_w),
+                        Object::Integer(page_h),
+                    ]),
+                );
+                page_ids.push(doc.add_object(Object::Dictionary(page_dict)));
+            }
+
+            // Pages
+            let kids: Vec<Object> = page_ids.iter().map(|id| Object::Reference(*id)).collect();
+            let mut pages_dict = lopdf::Dictionary::new();
+            pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
+            pages_dict.set("Kids", Object::Array(kids));
+            pages_dict.set("Count", Object::Integer(page_ids.len() as i64));
+            let pages_id = doc.add_object(Object::Dictionary(pages_dict));
+
+            // Update Parent on all pages
+            for pid in &page_ids {
+                if let Ok(page_obj) = doc.get_object_mut(*pid) {
+                    if let Object::Dictionary(ref mut dict) = page_obj {
+                        dict.set("Parent", Object::Reference(pages_id));
+                    }
+                }
+            }
+
+            // Catalog
+            let mut catalog = lopdf::Dictionary::new();
+            catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+            catalog.set("Pages", Object::Reference(pages_id));
+            let catalog_id = doc.add_object(Object::Dictionary(catalog));
+
+            doc.trailer.set("Root", Object::Reference(catalog_id));
+
+            doc.save(output).map_err(|e| format!("PDF save error: {}", e))?;
+            Ok(output.to_string())
+        }
+        _ => Err(format!("Cannot convert {} to PDF", in_ext)),
+    }
+}
+
 // ─── Tauri Commands ────────────────────────────────────────────────
 
 #[tauri::command]
@@ -352,6 +579,16 @@ fn convert_file(
         "zip" | "rar" | "7z" | "tar" | "gz" => "archive",
         _ => "unknown",
     };
+
+    // Check if target is PDF — use dedicated converter
+    let out_ext = Path::new(&output_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if out_ext == "pdf" {
+        return convert_to_pdf(&input_path, &output_path);
+    }
 
     match category {
         "image" => convert_image(&input_path, &output_path, quality),
@@ -602,8 +839,7 @@ fn apply_signature(
         .map_err(|e| format!("PDF load error: {}", e))?;
 
     // Decode the base64 signature image
-    let img_data = if placement.signature_image_base64.contains(",") {
-        // data:image/png;base64,<data>
+    let img_data = if placement.signature_image_base64.contains(',') {
         let parts: Vec<&str> = placement.signature_image_base64.splitn(2, ',').collect();
         STANDARD.decode(parts.get(1).unwrap_or(&""))
             .map_err(|e| format!("Base64 decode error: {}", e))?
@@ -612,14 +848,33 @@ fn apply_signature(
             .map_err(|e| format!("Base64 decode error: {}", e))?
     };
 
-    // Decode PNG to raw RGB pixels using the image crate
+    // Decode PNG to RGBA to preserve transparency
     let img = image::load_from_memory(&img_data)
         .map_err(|e| format!("Image decode error: {}", e))?;
-    let rgb_img = img.to_rgb8();
-    let (img_w, img_h) = rgb_img.dimensions();
-    let raw_pixels = rgb_img.into_raw();
+    let rgba_img = img.to_rgba8();
+    let (img_w, img_h) = rgba_img.dimensions();
 
-    // Create an Image XObject stream
+    // Separate RGB and Alpha channels
+    let mut rgb_pixels = Vec::with_capacity((img_w * img_h * 3) as usize);
+    let mut alpha_pixels = Vec::with_capacity((img_w * img_h) as usize);
+    for pixel in rgba_img.pixels() {
+        rgb_pixels.push(pixel[0]);
+        rgb_pixels.push(pixel[1]);
+        rgb_pixels.push(pixel[2]);
+        alpha_pixels.push(pixel[3]);
+    }
+
+    // Create SMask (alpha channel) as a separate Image XObject
+    let mut smask_dict = lopdf::Dictionary::new();
+    smask_dict.set("Type", Object::Name(b"XObject".to_vec()));
+    smask_dict.set("Subtype", Object::Name(b"Image".to_vec()));
+    smask_dict.set("Width", Object::Integer(img_w as i64));
+    smask_dict.set("Height", Object::Integer(img_h as i64));
+    smask_dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+    smask_dict.set("BitsPerComponent", Object::Integer(8));
+    let smask_id = doc.add_object(Object::Stream(lopdf::Stream::new(smask_dict, alpha_pixels)));
+
+    // Create the RGB Image XObject with SMask reference
     let mut img_dict = lopdf::Dictionary::new();
     img_dict.set("Type", Object::Name(b"XObject".to_vec()));
     img_dict.set("Subtype", Object::Name(b"Image".to_vec()));
@@ -627,9 +882,8 @@ fn apply_signature(
     img_dict.set("Height", Object::Integer(img_h as i64));
     img_dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
     img_dict.set("BitsPerComponent", Object::Integer(8));
-
-    let img_stream = lopdf::Stream::new(img_dict, raw_pixels);
-    let img_obj_id = doc.add_object(Object::Stream(img_stream));
+    img_dict.set("SMask", Object::Reference(smask_id));
+    let img_obj_id = doc.add_object(Object::Stream(lopdf::Stream::new(img_dict, rgb_pixels)));
 
     // Get the target page
     let pages = doc.get_pages();
@@ -639,18 +893,48 @@ fn apply_signature(
         .cloned()
         .ok_or_else(|| format!("Page {} not found", page_num))?;
 
+    // Get page dimensions from MediaBox
+    let (page_w, page_h) = {
+        let page_obj = doc.get_object(page_id)
+            .map_err(|e| format!("Page object error: {}", e))?;
+        if let Object::Dictionary(ref dict) = page_obj {
+            if let Ok(Object::Array(ref media_box)) = dict.get(b"MediaBox") {
+                let w = match &media_box[2] {
+                    Object::Integer(n) => *n as f64,
+                    Object::Real(n) => *n as f64,
+                    _ => 612.0,
+                };
+                let h = match &media_box[3] {
+                    Object::Integer(n) => *n as f64,
+                    Object::Real(n) => *n as f64,
+                    _ => 792.0,
+                };
+                (w, h)
+            } else {
+                (612.0, 792.0) // Default US Letter
+            }
+        } else {
+            (612.0, 792.0)
+        }
+    };
+
+    // Convert fractional coordinates to PDF coordinates
+    // PDF Y-axis: 0 is at BOTTOM, increases upward
+    // Frontend Y: 0 is at TOP, increases downward
+    let sig_w = placement.width_fraction * page_w;
+    let sig_h = placement.height_fraction * page_h;
+    let sig_x = placement.x_fraction * page_w;
+    let sig_y = page_h - (placement.y_fraction * page_h) - sig_h; // flip Y
+
     // Add the image to the page's Resources/XObject dictionary
     let sig_name = b"Sig0".to_vec();
     if let Ok(page_obj) = doc.get_object_mut(page_id) {
         if let Object::Dictionary(ref mut page_dict) = page_obj {
-            // Ensure Resources exists
             let has_resources = page_dict.get(b"Resources").is_ok();
             if !has_resources {
                 page_dict.set("Resources", Object::Dictionary(lopdf::Dictionary::new()));
             }
-
             if let Ok(Object::Dictionary(ref mut resources)) = page_dict.get_mut(b"Resources") {
-                // Ensure XObject sub-dict exists
                 let has_xobject = resources.get(b"XObject").is_ok();
                 if !has_xobject {
                     resources.set("XObject", Object::Dictionary(lopdf::Dictionary::new()));
@@ -663,33 +947,27 @@ fn apply_signature(
     }
 
     // Build content stream to draw the signature image
-    let x = placement.x;
-    let y = placement.y;
-    let w = placement.width;
-    let h = placement.height;
     let mut draw_ops = format!(
         "\nq\n{} 0 0 {} {} {} cm\n/{} Do\nQ\n",
-        w, h, x, y,
+        sig_w, sig_h, sig_x, sig_y,
         String::from_utf8_lossy(&sig_name)
     );
 
-    // Optionally draw date text
+    // Optionally draw date text below signature
     if let Some(ref date_text) = placement.date_text {
-        let dx = placement.date_x.unwrap_or(x);
-        let dy = placement.date_y.unwrap_or(y - 15.0);
+        let date_y = sig_y - 14.0;
         draw_ops.push_str(&format!(
             "q\nBT\n/Helvetica 10 Tf\n{} {} Td\n({}) Tj\nET\nQ\n",
-            dx, dy, date_text
+            sig_x, date_y, date_text
         ));
     }
 
-    // Append the drawing operations to the page's content stream
+    // Append drawing operations to the page's content stream
     let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
         lopdf::Dictionary::new(),
         draw_ops.into_bytes(),
     )));
 
-    // Get current Contents and make it an array including our new stream
     if let Ok(page_obj) = doc.get_object_mut(page_id) {
         if let Object::Dictionary(ref mut page_dict) = page_obj {
             let existing_contents = page_dict.get(b"Contents").ok().cloned();
