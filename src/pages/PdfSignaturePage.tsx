@@ -408,10 +408,10 @@ export function PdfSignaturePage() {
               <TabsContent value="draw" className="space-y-2">
                 <canvas
                   ref={canvasRef}
-                  width={500}
-                  height={160}
+                  width={560}
+                  height={200}
                   className="w-full rounded border bg-white cursor-crosshair"
-                  style={{ height: "120px" }}
+                  style={{ height: "150px" }}
                   onMouseDown={startDraw}
                   onMouseMove={draw}
                   onMouseUp={endDraw}

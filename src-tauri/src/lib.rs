@@ -1061,16 +1061,39 @@ fn apply_signature(
         draw_ops,
     )));
 
+    // Wrap existing content in q/Q to isolate its graphics state,
+    // then append our signature drawing with a clean graphics state.
+    // This prevents unbalanced CTM transforms in existing content from
+    // affecting our coordinate system.
+    let save_state_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        lopdf::Dictionary::new(),
+        b"q\n".to_vec(),
+    )));
+    let restore_state_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        lopdf::Dictionary::new(),
+        b"Q\n".to_vec(),
+    )));
+
     if let Ok(page_obj) = doc.get_object_mut(page_id) {
         if let Object::Dictionary(ref mut page_dict) = page_obj {
             let existing_contents = page_dict.get(b"Contents").ok().cloned();
             let new_contents = match existing_contents {
                 Some(Object::Reference(ref_id)) => {
-                    Object::Array(vec![Object::Reference(ref_id), Object::Reference(content_id)])
+                    // Wrap: q, existing, Q, signature
+                    Object::Array(vec![
+                        Object::Reference(save_state_id),
+                        Object::Reference(ref_id),
+                        Object::Reference(restore_state_id),
+                        Object::Reference(content_id),
+                    ])
                 }
-                Some(Object::Array(mut arr)) => {
-                    arr.push(Object::Reference(content_id));
-                    Object::Array(arr)
+                Some(Object::Array(arr)) => {
+                    // Wrap: q, ...existing..., Q, signature
+                    let mut new_arr = vec![Object::Reference(save_state_id)];
+                    new_arr.extend(arr);
+                    new_arr.push(Object::Reference(restore_state_id));
+                    new_arr.push(Object::Reference(content_id));
+                    Object::Array(new_arr)
                 }
                 _ => Object::Reference(content_id),
             };
