@@ -95,6 +95,10 @@
     "exportMd": "Export Markdown",
     "noText": "No text extracted"
   },
+  "errors": {
+    "tesseractNotInstalled": "Tesseract OCR is not installed. Download it from: https://github.com/UB-Mannheim/tesseract/wiki then restart the app.",
+    "ffmpegNotInstalled": "ffmpeg is not installed. Download it from: https://ffmpeg.org/download.html then add it to your PATH and restart the app."
+  },
   "common": {
     "cancel": "Cancel",
     "save": "Save",

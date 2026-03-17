@@ -305,6 +305,83 @@ fn extract_docx_text(path: &str) -> Result<String, String> {
 
 // ─── PDF helpers ───────────────────────────────────────────────────
 
+/// Convert a UTF-8 char to WinAnsiEncoding byte
+fn char_to_winansi(c: char) -> u8 {
+    let cp = c as u32;
+    if cp < 128 {
+        return cp as u8;
+    }
+    match cp {
+        0x00A0..=0x00FF => cp as u8, // Latin-1 supplement (é=0xE9, è=0xE8, ê=0xEA, etc.)
+        0x20AC => 0x80, 0x201A => 0x82, 0x0192 => 0x83, 0x201E => 0x84,
+        0x2026 => 0x85, 0x2020 => 0x86, 0x2021 => 0x87, 0x02C6 => 0x88,
+        0x2030 => 0x89, 0x0160 => 0x8A, 0x2039 => 0x8B, 0x0152 => 0x8C,
+        0x017D => 0x8E, 0x2018 => 0x91, 0x2019 => 0x92, 0x201C => 0x93,
+        0x201D => 0x94, 0x2022 => 0x95, 0x2013 => 0x96, 0x2014 => 0x97,
+        0x02DC => 0x98, 0x2122 => 0x99, 0x0161 => 0x9A, 0x203A => 0x9B,
+        0x0153 => 0x9C, 0x017E => 0x9E, 0x0178 => 0x9F,
+        _ => b'?',
+    }
+}
+
+/// Encode a UTF-8 string as WinAnsi PDF text bytes: (escaped_content)
+fn encode_pdf_text(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(b'(');
+    for c in s.chars() {
+        let b = char_to_winansi(c);
+        match b {
+            b'(' => out.extend_from_slice(b"\\("),
+            b')' => out.extend_from_slice(b"\\)"),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            _ => out.push(b),
+        }
+    }
+    out.push(b')');
+    out
+}
+
+/// Parse a MediaBox array [x0, y0, x1, y1]
+fn parse_media_box(arr: &[Object]) -> (f64, f64, f64, f64) {
+    let get = |i: usize| -> f64 {
+        match arr.get(i) {
+            Some(Object::Integer(n)) => *n as f64,
+            Some(Object::Real(n)) => *n as f64,
+            _ => 0.0,
+        }
+    };
+    (get(0), get(1), get(2), get(3))
+}
+
+/// Get effective MediaBox for a page, traversing parent Pages tree for inheritance
+fn get_effective_media_box(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> (f64, f64, f64, f64) {
+    if let Ok(page_obj) = doc.get_object(page_id) {
+        if let Object::Dictionary(ref dict) = page_obj {
+            if let Ok(Object::Array(ref mb)) = dict.get(b"MediaBox") {
+                return parse_media_box(mb);
+            }
+            if let Ok(Object::Reference(parent_id)) = dict.get(b"Parent") {
+                return get_media_box_from_parent(doc, *parent_id);
+            }
+        }
+    }
+    (0.0, 0.0, 612.0, 792.0)
+}
+
+fn get_media_box_from_parent(doc: &lopdf::Document, pages_id: lopdf::ObjectId) -> (f64, f64, f64, f64) {
+    if let Ok(obj) = doc.get_object(pages_id) {
+        if let Object::Dictionary(ref dict) = obj {
+            if let Ok(Object::Array(ref mb)) = dict.get(b"MediaBox") {
+                return parse_media_box(mb);
+            }
+            if let Ok(Object::Reference(parent_id)) = dict.get(b"Parent") {
+                return get_media_box_from_parent(doc, *parent_id);
+            }
+        }
+    }
+    (0.0, 0.0, 612.0, 792.0)
+}
+
 /// Remap all object references within an Object by adding an offset to IDs
 fn remap_refs(obj: &Object, offset: u32) -> Object {
     match obj {
@@ -460,29 +537,27 @@ fn convert_to_pdf(input: &str, output: &str) -> Result<String, String> {
             let mut page_ids: Vec<lopdf::ObjectId> = Vec::new();
 
             for chunk in lines.chunks(lines_per_page) {
-                let mut content = String::new();
-                content.push_str(&format!("BT\n/F1 {} Tf\n", font_size));
-                content.push_str(&format!("{} {} Td\n", margin, page_h as f64 - margin));
+                // Build content stream as raw bytes for WinAnsi encoding
+                let mut content_bytes: Vec<u8> = Vec::new();
+                content_bytes.extend_from_slice(format!("BT\n/F1 {} Tf\n", font_size).as_bytes());
+                content_bytes.extend_from_slice(format!("{} {} Td\n", margin, page_h as f64 - margin).as_bytes());
                 for line in chunk {
-                    // Escape PDF special chars
-                    let escaped = line
-                        .replace('\\', "\\\\")
-                        .replace('(', "\\(")
-                        .replace(')', "\\)");
-                    content.push_str(&format!("({}) Tj\n0 -{} Td\n", escaped, line_height));
+                    content_bytes.extend_from_slice(&encode_pdf_text(line));
+                    content_bytes.extend_from_slice(format!(" Tj\n0 -{} Td\n", line_height).as_bytes());
                 }
-                content.push_str("ET\n");
+                content_bytes.extend_from_slice(b"ET\n");
 
                 let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
                     lopdf::Dictionary::new(),
-                    content.into_bytes(),
+                    content_bytes,
                 )));
 
-                // Font resource
+                // Font resource with WinAnsiEncoding for accent support
                 let mut font_dict = lopdf::Dictionary::new();
                 font_dict.set("Type", Object::Name(b"Font".to_vec()));
                 font_dict.set("Subtype", Object::Name(b"Type1".to_vec()));
                 font_dict.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+                font_dict.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
                 let mut fonts = lopdf::Dictionary::new();
                 fonts.set("F1", Object::Dictionary(font_dict));
                 let mut resources = lopdf::Dictionary::new();
@@ -608,7 +683,7 @@ fn convert_file(
             let output = cmd
                 .arg(&output_path)
                 .output()
-                .map_err(|e| format!("ffmpeg error: {}. Make sure ffmpeg is installed and in PATH.", e))?;
+                .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -893,79 +968,97 @@ fn apply_signature(
         .cloned()
         .ok_or_else(|| format!("Page {} not found", page_num))?;
 
-    // Get page dimensions from MediaBox
-    let (page_w, page_h) = {
-        let page_obj = doc.get_object(page_id)
-            .map_err(|e| format!("Page object error: {}", e))?;
-        if let Object::Dictionary(ref dict) = page_obj {
-            if let Ok(Object::Array(ref media_box)) = dict.get(b"MediaBox") {
-                let w = match &media_box[2] {
-                    Object::Integer(n) => *n as f64,
-                    Object::Real(n) => *n as f64,
-                    _ => 612.0,
-                };
-                let h = match &media_box[3] {
-                    Object::Integer(n) => *n as f64,
-                    Object::Real(n) => *n as f64,
-                    _ => 792.0,
-                };
-                (w, h)
-            } else {
-                (612.0, 792.0) // Default US Letter
-            }
-        } else {
-            (612.0, 792.0)
-        }
-    };
+    // Get page dimensions from MediaBox (traverses parent tree for inheritance)
+    let (x0, y0, x1, y1) = get_effective_media_box(&doc, page_id);
+    let page_w = x1 - x0;
+    let page_h = y1 - y0;
 
     // Convert fractional coordinates to PDF coordinates
     // PDF Y-axis: 0 is at BOTTOM, increases upward
     // Frontend Y: 0 is at TOP, increases downward
     let sig_w = placement.width_fraction * page_w;
     let sig_h = placement.height_fraction * page_h;
-    let sig_x = placement.x_fraction * page_w;
-    let sig_y = page_h - (placement.y_fraction * page_h) - sig_h; // flip Y
+    let sig_x = x0 + placement.x_fraction * page_w;
+    let sig_y = y0 + page_h - (placement.y_fraction * page_h) - sig_h; // flip Y
 
-    // Add the image to the page's Resources/XObject dictionary
+    // Add the image (and font for date) to the page's Resources
+    // If Resources is a Reference, resolve and inline it to avoid modifying shared objects
     let sig_name = b"Sig0".to_vec();
     if let Ok(page_obj) = doc.get_object_mut(page_id) {
         if let Object::Dictionary(ref mut page_dict) = page_obj {
-            let has_resources = page_dict.get(b"Resources").is_ok();
-            if !has_resources {
+            // Ensure Resources is an inline Dictionary (not a Reference)
+            let needs_inline = matches!(page_dict.get(b"Resources"), Ok(Object::Reference(_)));
+            if needs_inline {
+                // Resolve the reference and inline the dict
+                if let Ok(Object::Reference(res_ref)) = page_dict.get(b"Resources") {
+                    let res_ref = *res_ref;
+                    if let Ok(res_obj) = doc.get_object(res_ref) {
+                        let cloned = res_obj.clone();
+                        // Re-borrow mutably after immutable borrow
+                        if let Ok(page_obj2) = doc.get_object_mut(page_id) {
+                            if let Object::Dictionary(ref mut pd2) = page_obj2 {
+                                pd2.set("Resources", cloned);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Now safely modify the inlined Resources
+    if let Ok(page_obj) = doc.get_object_mut(page_id) {
+        if let Object::Dictionary(ref mut page_dict) = page_obj {
+            if page_dict.get(b"Resources").is_err() {
                 page_dict.set("Resources", Object::Dictionary(lopdf::Dictionary::new()));
             }
             if let Ok(Object::Dictionary(ref mut resources)) = page_dict.get_mut(b"Resources") {
-                let has_xobject = resources.get(b"XObject").is_ok();
-                if !has_xobject {
+                // Add XObject for signature image
+                if resources.get(b"XObject").is_err() {
                     resources.set("XObject", Object::Dictionary(lopdf::Dictionary::new()));
                 }
                 if let Ok(Object::Dictionary(ref mut xobjects)) = resources.get_mut(b"XObject") {
                     xobjects.set(sig_name.clone(), Object::Reference(img_obj_id));
+                }
+                // Add Font/Helvetica for date text
+                if placement.date_text.is_some() {
+                    if resources.get(b"Font").is_err() {
+                        resources.set("Font", Object::Dictionary(lopdf::Dictionary::new()));
+                    }
+                    if let Ok(Object::Dictionary(ref mut fonts)) = resources.get_mut(b"Font") {
+                        let mut helv = lopdf::Dictionary::new();
+                        helv.set("Type", Object::Name(b"Font".to_vec()));
+                        helv.set("Subtype", Object::Name(b"Type1".to_vec()));
+                        helv.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+                        helv.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
+                        fonts.set("F1", Object::Dictionary(helv));
+                    }
                 }
             }
         }
     }
 
     // Build content stream to draw the signature image
-    let mut draw_ops = format!(
-        "\nq\n{} 0 0 {} {} {} cm\n/{} Do\nQ\n",
-        sig_w, sig_h, sig_x, sig_y,
-        String::from_utf8_lossy(&sig_name)
+    let mut draw_ops: Vec<u8> = Vec::new();
+    draw_ops.extend_from_slice(
+        format!(
+            "\nq\n{} 0 0 {} {} {} cm\n/{} Do\nQ\n",
+            sig_w, sig_h, sig_x, sig_y,
+            String::from_utf8_lossy(&sig_name)
+        ).as_bytes()
     );
 
-    // Optionally draw date text below signature
+    // Optionally draw date text below signature (using WinAnsi encoding)
     if let Some(ref date_text) = placement.date_text {
         let date_y = sig_y - 14.0;
-        draw_ops.push_str(&format!(
-            "q\nBT\n/Helvetica 10 Tf\n{} {} Td\n({}) Tj\nET\nQ\n",
-            sig_x, date_y, date_text
-        ));
+        draw_ops.extend_from_slice(format!("q\nBT\n/F1 10 Tf\n{} {} Td\n", sig_x, date_y).as_bytes());
+        draw_ops.extend_from_slice(&encode_pdf_text(date_text));
+        draw_ops.extend_from_slice(b" Tj\nET\nQ\n");
     }
 
     // Append drawing operations to the page's content stream
     let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
         lopdf::Dictionary::new(),
-        draw_ops.into_bytes(),
+        draw_ops,
     )));
 
     if let Ok(page_obj) = doc.get_object_mut(page_id) {
@@ -1032,9 +1125,7 @@ fn ocr_extract(path: String, language: String) -> Result<OcrResult, String> {
 
     if check.is_err() {
         return Err(
-            "Tesseract OCR is not installed.\n\
-             Install it from: https://github.com/UB-Mannheim/tesseract/wiki\n\
-             After installation, restart the application."
+            "TESSERACT_NOT_INSTALLED"
                 .to_string(),
         );
     }

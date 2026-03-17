@@ -48,7 +48,12 @@ export function OcrPage() {
         toast.info(t("ocr.noText"));
       }
     } catch (err) {
-      toast.error(String(err));
+      const msg = String(err);
+      if (msg.includes("TESSERACT_NOT_INSTALLED")) {
+        toast.error(t("errors.tesseractNotInstalled"));
+      } else {
+        toast.error(msg);
+      }
     }
     setExtracting(false);
   };

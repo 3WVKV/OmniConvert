@@ -229,22 +229,24 @@ export function PdfToolkitPage() {
           </div>
 
           {/* Tools panel */}
-          <div className="flex w-72 shrink-0 flex-col gap-3 rounded-lg border bg-card p-4">
+          <div className="flex w-80 shrink-0 flex-col gap-3 rounded-lg border bg-card p-4 overflow-y-auto">
             <Tabs defaultValue="split">
-              <TabsList className="w-full flex-wrap h-auto gap-1">
-                <TabsTrigger value="split" className="text-xs">
+              <TabsList className="grid w-full grid-cols-3 h-auto gap-1 mb-1">
+                <TabsTrigger value="split" className="text-xs px-2 py-1.5">
                   <Scissors className="mr-1 h-3 w-3" /> {t("pdfToolkit.split")}
                 </TabsTrigger>
-                <TabsTrigger value="extract" className="text-xs">
+                <TabsTrigger value="extract" className="text-xs px-2 py-1.5">
                   <FileOutput className="mr-1 h-3 w-3" /> {t("pdfToolkit.extract")}
                 </TabsTrigger>
-                <TabsTrigger value="rotate" className="text-xs">
+                <TabsTrigger value="rotate" className="text-xs px-2 py-1.5">
                   <RotateCw className="mr-1 h-3 w-3" /> {t("pdfToolkit.rotate")}
                 </TabsTrigger>
-                <TabsTrigger value="compress" className="text-xs">
+              </TabsList>
+              <TabsList className="grid w-full grid-cols-2 h-auto gap-1">
+                <TabsTrigger value="compress" className="text-xs px-2 py-1.5">
                   <Minimize2 className="mr-1 h-3 w-3" /> {t("pdfToolkit.compress")}
                 </TabsTrigger>
-                <TabsTrigger value="convert" className="text-xs">
+                <TabsTrigger value="convert" className="text-xs px-2 py-1.5">
                   <FileImage className="mr-1 h-3 w-3" /> {t("pdfToolkit.convertTo")}
                 </TabsTrigger>
               </TabsList>

@@ -19,7 +19,6 @@ import { renderPdfPageToBase64 } from "@/lib/pdfRenderer";
 import { toast } from "sonner";
 
 interface SigOverlay {
-  // Position as fraction (0-1) of the preview container
   xFrac: number;
   yFrac: number;
   wFrac: number;
@@ -51,6 +50,7 @@ export function PdfSignaturePage() {
   // Signature overlay on the PDF preview
   const [sigOverlay, setSigOverlay] = useState<SigOverlay | null>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
   const dragState = useRef<{
     type: "move" | "resize";
     startX: number;
@@ -101,36 +101,40 @@ export function PdfSignaturePage() {
     await renderPage(pdfBase64, page);
   };
 
-  // Place signature overlay on the preview when a signature is selected
+  // Place signature overlay on the preview
   const placeSignatureOnPreview = () => {
     if (!signatureImage) return;
-    // Default: center of page, 25% width, 8% height
     setSigOverlay({
-      xFrac: 0.375,
-      yFrac: 0.46,
-      wFrac: 0.25,
+      xFrac: 0.55,
+      yFrac: 0.82,
+      wFrac: 0.3,
       hFrac: 0.08,
     });
   };
 
+  // Get the actual image element dimensions for accurate fractional calculations
+  const getImageRect = (): DOMRect | null => {
+    return imgRef.current?.getBoundingClientRect() ?? null;
+  };
+
   // Mouse handlers for drag & resize
-  const handleOverlayMouseDown = (e: React.MouseEvent, type: "move" | "resize") => {
+  const handleOverlayMouseDown = (e: React.MouseEvent, actionType: "move" | "resize") => {
     e.preventDefault();
     e.stopPropagation();
     if (!sigOverlay) return;
     dragState.current = {
-      type,
+      type: actionType,
       startX: e.clientX,
       startY: e.clientY,
       startOverlay: { ...sigOverlay },
     };
 
     const handleMouseMove = (ev: MouseEvent) => {
-      if (!dragState.current || !previewContainerRef.current) return;
-      const container = previewContainerRef.current;
-      const rect = container.getBoundingClientRect();
-      const dx = (ev.clientX - dragState.current.startX) / rect.width;
-      const dy = (ev.clientY - dragState.current.startY) / rect.height;
+      if (!dragState.current) return;
+      const imgRect = getImageRect();
+      if (!imgRect) return;
+      const dx = (ev.clientX - dragState.current.startX) / imgRect.width;
+      const dy = (ev.clientY - dragState.current.startY) / imgRect.height;
       const s = dragState.current.startOverlay;
 
       if (dragState.current.type === "move") {
@@ -140,7 +144,6 @@ export function PdfSignaturePage() {
           yFrac: Math.max(0, Math.min(1 - s.hFrac, s.yFrac + dy)),
         });
       } else {
-        // Resize from bottom-right corner
         const newW = Math.max(0.05, Math.min(1 - s.xFrac, s.wFrac + dx));
         const newH = Math.max(0.03, Math.min(1 - s.yFrac, s.hFrac + dy));
         setSigOverlay({ ...s, wFrac: newW, hFrac: newH });
@@ -157,7 +160,9 @@ export function PdfSignaturePage() {
     window.addEventListener("mouseup", handleMouseUp);
   };
 
-  // Drawing handlers
+  // Smooth drawing with quadratic curves
+  const lastPoint = useRef<{ x: number; y: number } | null>(null);
+
   const startDraw = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -165,8 +170,13 @@ export function PdfSignaturePage() {
     if (!ctx) return;
     setDrawing(true);
     const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
+    lastPoint.current = { x, y };
     ctx.beginPath();
-    ctx.moveTo(e.clientX - rect.left, e.clientY - rect.top);
+    ctx.moveTo(x, y);
   };
 
   const draw = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -176,15 +186,31 @@ export function PdfSignaturePage() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const rect = canvas.getBoundingClientRect();
-    ctx.lineWidth = 2;
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
+
+    ctx.lineWidth = 3;
     ctx.lineCap = "round";
+    ctx.lineJoin = "round";
     ctx.strokeStyle = "#000";
-    ctx.lineTo(e.clientX - rect.left, e.clientY - rect.top);
-    ctx.stroke();
+
+    if (lastPoint.current) {
+      // Smooth quadratic curve
+      const midX = (lastPoint.current.x + x) / 2;
+      const midY = (lastPoint.current.y + y) / 2;
+      ctx.quadraticCurveTo(lastPoint.current.x, lastPoint.current.y, midX, midY);
+      ctx.stroke();
+    }
+
+    lastPoint.current = { x, y };
   };
 
   const endDraw = () => {
+    if (!drawing) return;
     setDrawing(false);
+    lastPoint.current = null;
     const canvas = canvasRef.current;
     if (canvas) {
       setSignatureImage(canvas.toDataURL("image/png"));
@@ -205,13 +231,14 @@ export function PdfSignaturePage() {
   useEffect(() => {
     if (signatureMode !== "type" || !typedName) return;
     const canvas = document.createElement("canvas");
-    canvas.width = 300;
-    canvas.height = 80;
+    canvas.width = 500;
+    canvas.height = 120;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.font = "italic 32px 'Geist Variable', serif";
+    ctx.font = "italic 48px 'Geist Variable', serif";
     ctx.fillStyle = "#000";
-    ctx.fillText(typedName, 10, 50);
+    ctx.textBaseline = "middle";
+    ctx.fillText(typedName, 10, 60);
     setSignatureImage(canvas.toDataURL("image/png"));
   }, [typedName, signatureMode]);
 
@@ -289,7 +316,7 @@ export function PdfSignaturePage() {
         />
       ) : (
         <div className="flex flex-1 gap-4 min-h-0">
-          {/* PDF Preview with signature overlay */}
+          {/* PDF Preview centered with signature overlay */}
           <div className="flex flex-1 flex-col items-center gap-2 min-h-0">
             <div className="flex items-center gap-2">
               <Button variant="ghost" size="icon" onClick={() => goToPage(currentPage - 1)} disabled={currentPage <= 1}>
@@ -306,15 +333,22 @@ export function PdfSignaturePage() {
                 {t("common.close")}
               </Button>
             </div>
-            <div className="flex-1 overflow-auto rounded-lg border bg-white min-h-0 w-full">
+            {/* Centered scroll area */}
+            <div className="flex-1 overflow-auto rounded-lg border bg-white min-h-0 w-full flex items-start justify-center">
               {loadingPage ? (
-                <div className="flex h-full items-center justify-center text-muted-foreground">
+                <div className="flex h-full w-full items-center justify-center text-muted-foreground">
                   <Loader2 className="mr-2 h-5 w-5 animate-spin" />
                   {t("common.loading")}
                 </div>
               ) : pageImageSrc ? (
-                <div ref={previewContainerRef} className="relative inline-block">
-                  <img src={pageImageSrc} alt="PDF page" className="max-w-full select-none" draggable={false} />
+                <div ref={previewContainerRef} className="relative inline-block m-auto">
+                  <img
+                    ref={imgRef}
+                    src={pageImageSrc}
+                    alt="PDF page"
+                    className="max-w-full max-h-[70vh] select-none"
+                    draggable={false}
+                  />
                   {/* Signature overlay */}
                   {sigOverlay && signatureImage && (
                     <div
@@ -335,21 +369,21 @@ export function PdfSignaturePage() {
                       />
                       {/* Resize handle (bottom-right) */}
                       <div
-                        className="absolute -bottom-1.5 -right-1.5 h-3 w-3 rounded-full bg-blue-600 cursor-se-resize"
+                        className="absolute -bottom-1.5 -right-1.5 h-3.5 w-3.5 rounded-full bg-blue-600 cursor-se-resize border-2 border-white"
                         onMouseDown={(e) => handleOverlayMouseDown(e, "resize")}
                       />
                       {/* Remove overlay button */}
                       <div
-                        className="absolute -top-2 -right-2 h-4 w-4 rounded-full bg-red-500 text-white flex items-center justify-center cursor-pointer text-xs leading-none"
+                        className="absolute -top-2.5 -right-2.5 h-5 w-5 rounded-full bg-red-500 text-white flex items-center justify-center cursor-pointer text-xs leading-none font-bold"
                         onClick={(e) => { e.stopPropagation(); setSigOverlay(null); }}
                       >
-                        ×
+                        x
                       </div>
                     </div>
                   )}
                 </div>
               ) : (
-                <div className="flex h-full items-center justify-center text-muted-foreground">
+                <div className="flex h-full w-full items-center justify-center text-muted-foreground">
                   {t("common.loading")}
                 </div>
               )}
@@ -357,7 +391,7 @@ export function PdfSignaturePage() {
           </div>
 
           {/* Signature panel */}
-          <div className="flex w-72 shrink-0 flex-col gap-3 rounded-lg border bg-card p-4 overflow-y-auto">
+          <div className="flex w-80 shrink-0 flex-col gap-3 rounded-lg border bg-card p-4 overflow-y-auto">
             <Tabs value={signatureMode} onValueChange={(v) => setSignatureMode(v as SignatureMode)}>
               <TabsList className="w-full">
                 <TabsTrigger value="draw" className="flex-1">
@@ -374,9 +408,10 @@ export function PdfSignaturePage() {
               <TabsContent value="draw" className="space-y-2">
                 <canvas
                   ref={canvasRef}
-                  width={240}
-                  height={80}
+                  width={500}
+                  height={160}
                   className="w-full rounded border bg-white cursor-crosshair"
+                  style={{ height: "120px" }}
                   onMouseDown={startDraw}
                   onMouseMove={draw}
                   onMouseUp={endDraw}
@@ -412,7 +447,7 @@ export function PdfSignaturePage() {
             {/* Place on PDF button */}
             {signatureImage && !sigOverlay && (
               <Button variant="outline" className="w-full" onClick={placeSignatureOnPreview}>
-                {t("pdfSignature.placeOnPage") || "Place on page"}
+                {t("pdfSignature.placeOnPage")}
               </Button>
             )}
 

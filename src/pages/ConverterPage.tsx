@@ -96,8 +96,12 @@ export function ConverterPage() {
         updateJob(file.id, { status: "completed", progress: 100, outputPath: result });
         toast.success(`${file.name} → .${targetFormat}`);
       } catch (err) {
-        updateJob(file.id, { status: "failed", error: String(err) });
-        toast.error(`${file.name}: ${err}`);
+        const msg = String(err);
+        const displayMsg = msg.includes("FFMPEG_NOT_INSTALLED")
+          ? t("errors.ffmpegNotInstalled")
+          : msg;
+        updateJob(file.id, { status: "failed", error: displayMsg });
+        toast.error(`${file.name}: ${displayMsg}`);
       }
     }
     setConverting(false);
