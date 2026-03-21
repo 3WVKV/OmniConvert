@@ -95,20 +95,8 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
         .unwrap_or("")
         .to_lowercase();
 
-    let format = match out_ext.as_str() {
-        "jpg" | "jpeg" => ImageFormat::Jpeg,
-        "png" => ImageFormat::Png,
-        "gif" => ImageFormat::Gif,
-        "bmp" => ImageFormat::Bmp,
-        "tiff" | "tif" => ImageFormat::Tiff,
-        "webp" => ImageFormat::WebP,
-        "avif" => ImageFormat::Avif,
-        "ico" => ImageFormat::Ico,
-        _ => return Err(format!("Unsupported output image format: {}", out_ext)),
-    };
-
-    match format {
-        ImageFormat::Jpeg => {
+    match out_ext.as_str() {
+        "jpg" | "jpeg" => {
             let mut buf = std::io::BufWriter::new(
                 fs::File::create(output).map_err(|e| format!("Cannot create output: {}", e))?,
             );
@@ -116,8 +104,7 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
             img.write_with_encoder(encoder)
                 .map_err(|e| format!("JPEG encode error: {}", e))?;
         }
-        ImageFormat::Png => {
-            // quality 1-100: 100=fast compression (bigger), 1=best compression (smaller)
+        "png" => {
             let compression = if quality >= 80 {
                 image::codecs::png::CompressionType::Fast
             } else if quality >= 40 {
@@ -133,8 +120,7 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
             img.write_with_encoder(encoder)
                 .map_err(|e| format!("PNG encode error: {}", e))?;
         }
-        ImageFormat::WebP => {
-            // Use ffmpeg for lossy WebP with quality control
+        "webp" => {
             if quality < 95 {
                 let ffmpeg = find_ffmpeg();
                 let q = quality.to_string();
@@ -144,19 +130,75 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
                 match cmd_output {
                     Ok(o) if o.status.success() => {}
                     _ => {
-                        img.save_with_format(output, format)
+                        img.save_with_format(output, ImageFormat::WebP)
                             .map_err(|e| format!("Failed to save image: {}", e))?;
                     }
                 }
             } else {
-                img.save_with_format(output, format)
+                img.save_with_format(output, ImageFormat::WebP)
                     .map_err(|e| format!("Failed to save image: {}", e))?;
             }
         }
-        _ => {
+        "ico" => {
+            // ICO requires dimensions 1..=256
+            let resized = if img.width() > 256 || img.height() > 256 {
+                img.resize(256, 256, image::imageops::FilterType::Lanczos3)
+            } else {
+                img.clone()
+            };
+            resized.save_with_format(output, ImageFormat::Ico)
+                .map_err(|e| format!("Failed to save ICO: {}", e))?;
+        }
+        "svg" => {
+            // Raster → SVG: embed image as base64 data URI
+            let mut png_buf: Vec<u8> = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut png_buf);
+            img.write_to(&mut cursor, ImageFormat::Png)
+                .map_err(|e| format!("PNG encode: {}", e))?;
+            let b64 = STANDARD.encode(&png_buf);
+            let svg = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="{}" height="{}" viewBox="0 0 {} {}">
+  <image width="{}" height="{}" href="data:image/png;base64,{}"/>
+</svg>"#,
+                img.width(), img.height(), img.width(), img.height(),
+                img.width(), img.height(), b64
+            );
+            fs::write(output, svg).map_err(|e| format!("Write SVG: {}", e))?;
+        }
+        "heic" => {
+            // HEIC encoding not natively supported — use ImageMagick/ffmpeg
+            let magick = if cfg!(windows) { "magick" } else { "convert" };
+            let result = Command::new(magick)
+                .arg(input).arg(output)
+                .output();
+            match result {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    let ffmpeg = find_ffmpeg();
+                    let result2 = Command::new(&ffmpeg)
+                        .args(["-y", "-i", input, output])
+                        .output();
+                    match result2 {
+                        Ok(o) if o.status.success() => {}
+                        _ => return Err("HEIC encoding requires ImageMagick or ffmpeg with libheif support".to_string()),
+                    }
+                }
+            }
+        }
+        "gif" | "bmp" | "tiff" | "tif" | "avif" => {
+            let format = match out_ext.as_str() {
+                "gif" => ImageFormat::Gif,
+                "bmp" => ImageFormat::Bmp,
+                "tiff" | "tif" => ImageFormat::Tiff,
+                "avif" => ImageFormat::Avif,
+                _ => unreachable!(),
+            };
             img.save_with_format(output, format)
                 .map_err(|e| format!("Failed to save image: {}", e))?;
         }
+        _ => return Err(format!("Unsupported output image format: {}", out_ext)),
     }
 
     Ok(output.to_string())
@@ -1277,25 +1319,88 @@ fn convert_archive(input: &str, output: &str) -> Result<String, String> {
 
 // ─── PDF as source conversion ───────────────────────────────────────
 
+/// Find ImageMagick executable (checks common install paths on Windows)
+fn find_magick() -> String {
+    if cfg!(windows) {
+        // Check PATH first
+        if let Ok(output) = Command::new("magick").arg("--version").output() {
+            if output.status.success() {
+                return "magick".to_string();
+            }
+        }
+        // Check common Windows install paths
+        let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+        let candidates = [
+            format!("{}\\ImageMagick-7.1.1-Q16-HDRI\\magick.exe", program_files),
+            format!("{}\\ImageMagick\\magick.exe", program_files),
+        ];
+        // Also search in Program Files for any ImageMagick folder
+        if let Ok(entries) = fs::read_dir(&program_files) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("ImageMagick") {
+                    let magick_path = entry.path().join("magick.exe");
+                    if magick_path.exists() {
+                        return magick_path.to_string_lossy().to_string();
+                    }
+                }
+            }
+        }
+        for path in &candidates {
+            if Path::new(path).exists() {
+                return path.clone();
+            }
+        }
+        "magick".to_string()
+    } else {
+        "convert".to_string()
+    }
+}
+
+/// Extract text from PDF: try pdftotext first, fallback to lopdf
+fn extract_pdf_text(input: &str) -> Result<String, String> {
+    // Try pdftotext (poppler-utils) first — much better extraction
+    if let Ok(output) = Command::new("pdftotext")
+        .arg("-layout")
+        .arg(input)
+        .arg("-")
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            if !text.trim().is_empty() {
+                return Ok(text);
+            }
+        }
+    }
+
+    // Fallback: lopdf
+    let doc = lopdf::Document::load(input)
+        .map_err(|e| format!("PDF load error: {}", e))?;
+    let mut text = String::new();
+    let pages = doc.get_pages();
+    for page_num in 1..=pages.len() as u32 {
+        if let Ok(page_text) = doc.extract_text(&[page_num]) {
+            text.push_str(&page_text);
+            text.push('\n');
+        }
+    }
+
+    // Last resort: try ImageMagick's identify to check if it's image-based
+    if text.trim().is_empty() {
+        return Ok("(No extractable text found in PDF — the document may contain scanned images. Use OCR to extract text.)".to_string());
+    }
+
+    Ok(text)
+}
+
 fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
     let out_ext = Path::new(output).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
     match out_ext.as_str() {
         // PDF → text-based formats: extract text then convert
         "txt" | "md" | "html" | "rtf" | "docx" => {
-            let doc = lopdf::Document::load(input)
-                .map_err(|e| format!("PDF load error: {}", e))?;
-            let mut text = String::new();
-            let pages = doc.get_pages();
-            for page_num in 1..=pages.len() as u32 {
-                if let Ok(page_text) = doc.extract_text(&[page_num]) {
-                    text.push_str(&page_text);
-                    text.push('\n');
-                }
-            }
-            if text.trim().is_empty() {
-                text = "(No extractable text found in PDF — the document may contain scanned images. Use OCR to extract text.)".to_string();
-            }
+            let text = extract_pdf_text(input)?;
 
             match out_ext.as_str() {
                 "txt" | "md" => {
@@ -1333,32 +1438,47 @@ fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
                 _ => unreachable!(),
             }
         }
-        // PDF → image formats: use poppler/pdftoppm or fallback message
+        // PDF → image formats: use ImageMagick or pdftoppm
         "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" => {
-            // Try using pdftoppm (poppler-utils) or magick (ImageMagick)
-            let pdftoppm = if cfg!(windows) { "pdftoppm" } else { "pdftoppm" };
+            let magick = find_magick();
+
+            // Try ImageMagick first (most common on Windows)
+            let result = Command::new(&magick)
+                .arg("-density").arg("200")
+                .arg(format!("{}[0]", input))
+                .arg("-quality").arg("95")
+                .arg(output)
+                .output();
+
+            match result {
+                Ok(out) if out.status.success() => {
+                    // If target is webp/bmp and ImageMagick doesn't support it, convert via image crate
+                    if Path::new(output).exists() {
+                        return Ok(output.to_string());
+                    }
+                }
+                _ => {}
+            }
+
+            // Fallback: try pdftoppm
             let temp_prefix = std::env::temp_dir().join(format!("omni_pdf2img_{}", std::process::id()));
             let temp_prefix_str = temp_prefix.to_string_lossy().to_string();
-
             let fmt_flag = match out_ext.as_str() {
                 "jpg" | "jpeg" => "-jpeg",
-                "png" => "-png",
+                "png" | "webp" | "bmp" => "-png",
                 "tiff" => "-tiff",
                 _ => "-png",
             };
-
-            // pdftoppm: convert first page
-            let result = Command::new(pdftoppm)
+            let result = Command::new("pdftoppm")
                 .arg(fmt_flag)
                 .arg("-f").arg("1").arg("-l").arg("1")
-                .arg("-singlefile")
+                .arg("-singlefile").arg("-r").arg("200")
                 .arg(input)
                 .arg(&temp_prefix_str)
                 .output();
 
             match result {
                 Ok(out) if out.status.success() => {
-                    // Find the generated file
                     let expected_ext = match out_ext.as_str() {
                         "jpg" | "jpeg" => "jpg",
                         "tiff" => "tif",
@@ -1366,7 +1486,6 @@ fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
                     };
                     let temp_file = format!("{}.{}", temp_prefix_str, expected_ext);
                     if Path::new(&temp_file).exists() {
-                        // If target format differs from pdftoppm output, convert with image crate
                         if out_ext == "webp" || out_ext == "bmp" {
                             let img = image::open(&temp_file).map_err(|e| format!("Image open: {}", e))?;
                             let fmt = match out_ext.as_str() {
@@ -1379,24 +1498,13 @@ fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
                             fs::copy(&temp_file, output).map_err(|e| format!("Copy: {}", e))?;
                         }
                         let _ = fs::remove_file(&temp_file);
-                        Ok(output.to_string())
-                    } else {
-                        Err("PDF to image: generated file not found".to_string())
+                        return Ok(output.to_string());
                     }
                 }
-                _ => {
-                    // Fallback: try ImageMagick's magick/convert
-                    let magick = if cfg!(windows) { "magick" } else { "convert" };
-                    let result = Command::new(magick)
-                        .arg(format!("{}[0]", input)) // first page
-                        .arg(output)
-                        .output();
-                    match result {
-                        Ok(out) if out.status.success() => Ok(output.to_string()),
-                        _ => Err("PDF to image requires poppler-utils (pdftoppm) or ImageMagick (magick). Please install one of them.".to_string()),
-                    }
-                }
+                _ => {}
             }
+
+            Err("PDF to image requires ImageMagick (magick) or poppler-utils (pdftoppm). Please install one and restart your computer.".to_string())
         }
         _ => Err(format!("PDF conversion to {} is not supported yet", out_ext)),
     }
