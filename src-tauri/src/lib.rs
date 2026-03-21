@@ -1845,21 +1845,148 @@ fn rotate_pdf(
 }
 
 #[tauri::command]
-fn compress_pdf(input_path: String, output_path: String, _quality: String) -> Result<String, String> {
+fn compress_pdf(input_path: String, output_path: String, quality: String) -> Result<String, String> {
+    let original_size = fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
+
+    // Determine image quality/max dimension based on compression level
+    let (img_quality, max_dim) = match quality.as_str() {
+        "low" => (35u8, 800u32),      // Aggressive: low quality, small images
+        "medium" => (55u8, 1200u32),   // Balanced
+        "high" => (75u8, 1600u32),     // Light: decent quality, reasonable images
+        _ => (55u8, 1200u32),
+    };
+
     let mut doc = lopdf::Document::load(&input_path)
         .map_err(|e| format!("PDF load error: {}", e))?;
 
+    // 1. Remove metadata, unused objects
+    doc.prune_objects();
+    doc.delete_zero_length_streams();
+    doc.renumber_objects();
+
+    // 2. Compress/downscale embedded images
+    let object_ids: Vec<lopdf::ObjectId> = doc.objects.keys().cloned().collect();
+    for id in object_ids {
+        let is_image = {
+            if let Ok(Object::Stream(ref stream)) = doc.get_object(id) {
+                let dict = &stream.dict;
+                if let Ok(Object::Name(ref subtype)) = dict.get(b"Subtype") {
+                    subtype == b"Image"
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if is_image {
+            // Get image info
+            let (width, height, has_smask, colorspace_is_rgb) = {
+                if let Ok(Object::Stream(ref stream)) = doc.get_object(id) {
+                    let dict = &stream.dict;
+                    let w = match dict.get(b"Width") {
+                        Ok(Object::Integer(n)) => *n as u32,
+                        _ => continue,
+                    };
+                    let h = match dict.get(b"Height") {
+                        Ok(Object::Integer(n)) => *n as u32,
+                        _ => continue,
+                    };
+                    let has_smask = dict.get(b"SMask").is_ok();
+                    let is_rgb = match dict.get(b"ColorSpace") {
+                        Ok(Object::Name(ref cs)) => cs == b"DeviceRGB",
+                        _ => false,
+                    };
+                    (w, h, has_smask, is_rgb)
+                } else {
+                    continue;
+                }
+            };
+
+            // Only process RGB images without SMask (transparency complicates things)
+            if !colorspace_is_rgb || has_smask {
+                continue;
+            }
+
+            // Get decompressed pixel data
+            let pixel_data = {
+                if let Ok(Object::Stream(ref mut stream)) = doc.get_object_mut(id) {
+                    let _ = stream.decompress();
+                    stream.content.clone()
+                } else {
+                    continue;
+                }
+            };
+
+            let expected_len = (width * height * 3) as usize;
+            if pixel_data.len() != expected_len {
+                continue; // Not raw RGB data
+            }
+
+            // Reconstruct image with image crate
+            let img_buf = match image::RgbImage::from_raw(width, height, pixel_data) {
+                Some(buf) => buf,
+                None => continue,
+            };
+            let img = image::DynamicImage::ImageRgb8(img_buf);
+
+            // Resize if larger than max_dim
+            let resized = if width > max_dim || height > max_dim {
+                img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
+            } else {
+                img
+            };
+
+            // Re-encode as JPEG
+            let new_w = resized.width();
+            let new_h = resized.height();
+            let mut jpeg_buf = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut jpeg_buf);
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, img_quality);
+            resized.write_with_encoder(encoder).unwrap_or_else(|_| ());
+
+            if jpeg_buf.is_empty() {
+                continue;
+            }
+
+            // Replace the stream with JPEG data
+            if let Ok(Object::Stream(ref mut stream)) = doc.get_object_mut(id) {
+                stream.dict.set("Width", Object::Integer(new_w as i64));
+                stream.dict.set("Height", Object::Integer(new_h as i64));
+                stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+                stream.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+                stream.dict.set("BitsPerComponent", Object::Integer(8));
+                stream.dict.set("Length", Object::Integer(jpeg_buf.len() as i64));
+                // Remove old compression filter entries
+                stream.dict.remove(b"DecodeParms");
+                stream.content = jpeg_buf;
+                stream.allows_compression = false; // Already JPEG compressed
+            }
+        }
+    }
+
+    // 3. Compress all remaining streams
     doc.compress();
 
     doc.save(&output_path)
         .map_err(|e| format!("Save error: {}", e))?;
 
-    let original_size = fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
     let compressed_size = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
 
+    // If compression made it bigger, just copy the original
+    if compressed_size >= original_size {
+        fs::copy(&input_path, &output_path).map_err(|e| format!("Copy error: {}", e))?;
+        return Ok(format!(
+            "PDF already optimized ({} bytes). No further compression possible.",
+            original_size
+        ));
+    }
+
+    let saved_pct = ((original_size as f64 - compressed_size as f64) / original_size as f64 * 100.0) as u32;
     Ok(format!(
-        "Compressed: {} → {} bytes",
-        original_size, compressed_size
+        "Compressed: {} → {} bytes (-{}%)",
+        original_size, compressed_size, saved_pct
     ))
 }
 
