@@ -176,35 +176,147 @@ fn convert_data(input: &str, output: &str) -> Result<String, String> {
         .unwrap_or("")
         .to_lowercase();
 
-    let content = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
-
     // Parse to intermediate JSON value
     let data: serde_json::Value = match in_ext.as_str() {
-        "json" => serde_json::from_str(&content).map_err(|e| format!("JSON parse: {}", e))?,
-        "csv" => {
-            let mut reader = csv::ReaderBuilder::new()
-                .from_reader(content.as_bytes());
-            let headers: Vec<String> = reader
-                .headers()
-                .map_err(|e| format!("CSV headers: {}", e))?
-                .iter()
-                .map(|h| h.to_string())
-                .collect();
-            let mut rows = Vec::new();
-            for result in reader.records() {
-                let record = result.map_err(|e| format!("CSV record: {}", e))?;
-                let mut obj = serde_json::Map::new();
-                for (i, field) in record.iter().enumerate() {
-                    let key = headers.get(i).cloned().unwrap_or_else(|| format!("col{}", i));
-                    obj.insert(key, serde_json::Value::String(field.to_string()));
+        "xlsx" | "xls" | "ods" => {
+            // Binary spreadsheet: extract cell data from shared strings + sheet XML
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+
+            // Read shared strings
+            let mut shared_strings: Vec<String> = Vec::new();
+            if let Ok(mut ss_file) = archive.by_name("xl/sharedStrings.xml") {
+                let mut ss_content = String::new();
+                std::io::Read::read_to_string(&mut ss_file, &mut ss_content)
+                    .map_err(|e| format!("Read shared strings: {}", e))?;
+                // Extract <t>...</t> values
+                let mut in_t = false;
+                let mut current = String::new();
+                let mut chars = ss_content.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch == '<' {
+                        let mut tag = String::new();
+                        for tc in chars.by_ref() {
+                            if tc == '>' { break; }
+                            tag.push(tc);
+                        }
+                        if tag == "t" || tag.starts_with("t ") {
+                            in_t = true;
+                            current.clear();
+                        } else if tag == "/t" {
+                            in_t = false;
+                            shared_strings.push(current.clone());
+                        }
+                    } else if in_t {
+                        current.push(ch);
+                    }
                 }
-                rows.push(serde_json::Value::Object(obj));
             }
-            serde_json::Value::Array(rows)
+
+            // Read sheet1
+            let sheet_names = ["xl/worksheets/sheet1.xml", "xl/worksheets/sheet.xml"];
+            let mut sheet_content = String::new();
+            for name in &sheet_names {
+                if let Ok(mut sheet_file) = archive.by_name(name) {
+                    std::io::Read::read_to_string(&mut sheet_file, &mut sheet_content)
+                        .map_err(|e| format!("Read sheet: {}", e))?;
+                    break;
+                }
+            }
+            if sheet_content.is_empty() {
+                return Err("Could not find worksheet in spreadsheet".to_string());
+            }
+
+            // Parse rows: extract <row>...<c r="A1" t="s"><v>0</v></c>...</row>
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for row_match in sheet_content.split("<row ") {
+                if !row_match.contains("<c ") { continue; }
+                let mut cells: Vec<(usize, String)> = Vec::new();
+                for cell_part in row_match.split("<c ") {
+                    if !cell_part.contains("<v>") { continue; }
+                    // Get column letter to determine position
+                    let col_idx = if let Some(r_start) = cell_part.find("r=\"") {
+                        let r_val = &cell_part[r_start + 3..];
+                        if let Some(end) = r_val.find('"') {
+                            let cell_ref = &r_val[..end];
+                            let col_letters: String = cell_ref.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+                            col_letters.chars().fold(0usize, |acc, c| acc * 26 + (c as usize - 'A' as usize + 1)) - 1
+                        } else { 0 }
+                    } else { 0 };
+
+                    let is_shared = cell_part.contains("t=\"s\"");
+                    if let Some(v_start) = cell_part.find("<v>") {
+                        if let Some(v_end) = cell_part.find("</v>") {
+                            let val = &cell_part[v_start + 3..v_end];
+                            let cell_value = if is_shared {
+                                if let Ok(idx) = val.parse::<usize>() {
+                                    shared_strings.get(idx).cloned().unwrap_or_default()
+                                } else { val.to_string() }
+                            } else {
+                                val.to_string()
+                            };
+                            cells.push((col_idx, cell_value));
+                        }
+                    }
+                }
+                if !cells.is_empty() {
+                    let max_col = cells.iter().map(|(c, _)| *c).max().unwrap_or(0);
+                    let mut row = vec![String::new(); max_col + 1];
+                    for (col, val) in cells {
+                        row[col] = val;
+                    }
+                    rows.push(row);
+                }
+            }
+
+            // First row = headers, rest = data
+            if rows.is_empty() {
+                serde_json::Value::Array(Vec::new())
+            } else {
+                let headers = rows.remove(0);
+                let json_rows: Vec<serde_json::Value> = rows.iter().map(|row| {
+                    let mut obj = serde_json::Map::new();
+                    for (i, val) in row.iter().enumerate() {
+                        let key = headers.get(i).filter(|h| !h.is_empty())
+                            .cloned().unwrap_or_else(|| format!("col{}", i));
+                        obj.insert(key, serde_json::Value::String(val.clone()));
+                    }
+                    serde_json::Value::Object(obj)
+                }).collect();
+                serde_json::Value::Array(json_rows)
+            }
         }
-        "xml" => serde_json::Value::String(content),
-        "yaml" | "yml" => serde_json::Value::String(content),
-        _ => return Err(format!("Unsupported input data format: {}", in_ext)),
+        _ => {
+            // Text-based formats
+            let content = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
+            match in_ext.as_str() {
+                "json" => serde_json::from_str(&content).map_err(|e| format!("JSON parse: {}", e))?,
+                "csv" => {
+                    let mut reader = csv::ReaderBuilder::new()
+                        .from_reader(content.as_bytes());
+                    let headers: Vec<String> = reader
+                        .headers()
+                        .map_err(|e| format!("CSV headers: {}", e))?
+                        .iter()
+                        .map(|h| h.to_string())
+                        .collect();
+                    let mut rows = Vec::new();
+                    for result in reader.records() {
+                        let record = result.map_err(|e| format!("CSV record: {}", e))?;
+                        let mut obj = serde_json::Map::new();
+                        for (i, field) in record.iter().enumerate() {
+                            let key = headers.get(i).cloned().unwrap_or_else(|| format!("col{}", i));
+                            obj.insert(key, serde_json::Value::String(field.to_string()));
+                        }
+                        rows.push(serde_json::Value::Object(obj));
+                    }
+                    serde_json::Value::Array(rows)
+                }
+                "xml" => serde_json::Value::String(content),
+                "yaml" | "yml" => serde_json::Value::String(content),
+                _ => return Err(format!("Unsupported input data format: {}", in_ext)),
+            }
+        }
     };
 
     let output_content = match out_ext.as_str() {
@@ -677,6 +789,123 @@ fn convert_to_pdf(input: &str, output: &str) -> Result<String, String> {
     }
 }
 
+// ─── Archive conversion ─────────────────────────────────────────────
+
+fn convert_archive(input: &str, output: &str) -> Result<String, String> {
+    let in_ext = Path::new(input).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let out_ext = Path::new(output).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    match (in_ext.as_str(), out_ext.as_str()) {
+        // ZIP → TAR
+        ("zip", "tar") => {
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+            let tar_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut tar_builder = tar::Builder::new(tar_file);
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i).map_err(|e| format!("ZIP entry: {}", e))?;
+                if entry.is_dir() { continue; }
+                let name = entry.name().to_string();
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar_builder.append_data(&mut header, &name, &data[..])
+                    .map_err(|e| format!("TAR append: {}", e))?;
+            }
+            tar_builder.finish().map_err(|e| format!("TAR finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // ZIP → GZ (tar.gz)
+        ("zip", "gz") => {
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+            let gz_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+            let mut tar_builder = tar::Builder::new(encoder);
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i).map_err(|e| format!("ZIP entry: {}", e))?;
+                if entry.is_dir() { continue; }
+                let name = entry.name().to_string();
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar_builder.append_data(&mut header, &name, &data[..])
+                    .map_err(|e| format!("TAR append: {}", e))?;
+            }
+            tar_builder.finish().map_err(|e| format!("TAR finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // TAR → ZIP
+        ("tar", "zip") => {
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut archive = tar::Archive::new(file);
+            let zip_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut zip_writer = zip::ZipWriter::new(zip_file);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for entry in archive.entries().map_err(|e| format!("TAR read: {}", e))? {
+                let mut entry = entry.map_err(|e| format!("TAR entry: {}", e))?;
+                let path = entry.path().map_err(|e| format!("Path: {}", e))?.to_string_lossy().to_string();
+                if entry.header().entry_type().is_dir() { continue; }
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                zip_writer.start_file(&path, options).map_err(|e| format!("ZIP write: {}", e))?;
+                std::io::Write::write_all(&mut zip_writer, &data).map_err(|e| format!("Write: {}", e))?;
+            }
+            zip_writer.finish().map_err(|e| format!("ZIP finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // TAR → GZ (compress)
+        ("tar", "gz") => {
+            let data = fs::read(input).map_err(|e| format!("Read error: {}", e))?;
+            let gz_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+            std::io::Write::write_all(&mut encoder, &data).map_err(|e| format!("GZ write: {}", e))?;
+            encoder.finish().map_err(|e| format!("GZ finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // GZ → TAR (decompress)
+        ("gz", "tar") => {
+            let gz_file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut decoder = flate2::read::GzDecoder::new(gz_file);
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut data).map_err(|e| format!("GZ decompress: {}", e))?;
+            fs::write(output, data).map_err(|e| format!("Write error: {}", e))?;
+            Ok(output.to_string())
+        }
+        // GZ → ZIP
+        ("gz", "zip") => {
+            let gz_file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut decoder = flate2::read::GzDecoder::new(gz_file);
+            let mut tar_data = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut tar_data).map_err(|e| format!("GZ decompress: {}", e))?;
+            // Try as tar archive
+            let cursor = std::io::Cursor::new(&tar_data);
+            let mut archive = tar::Archive::new(cursor);
+            let zip_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut zip_writer = zip::ZipWriter::new(zip_file);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for entry in archive.entries().map_err(|e| format!("TAR read: {}", e))? {
+                let mut entry = entry.map_err(|e| format!("TAR entry: {}", e))?;
+                let path = entry.path().map_err(|e| format!("Path: {}", e))?.to_string_lossy().to_string();
+                if entry.header().entry_type().is_dir() { continue; }
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                zip_writer.start_file(&path, options).map_err(|e| format!("ZIP write: {}", e))?;
+                std::io::Write::write_all(&mut zip_writer, &data).map_err(|e| format!("Write: {}", e))?;
+            }
+            zip_writer.finish().map_err(|e| format!("ZIP finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        _ => Err(format!("Conversion from {} to {} is not supported yet", in_ext, out_ext)),
+    }
+}
+
 // ─── Tauri Commands ────────────────────────────────────────────────
 
 #[tauri::command]
@@ -742,6 +971,7 @@ fn convert_file(
         }
         "data" => convert_data(&input_path, &output_path),
         "text" => convert_text(&input_path, &output_path),
+        "archive" => convert_archive(&input_path, &output_path),
         _ => Err(format!(
             "Conversion from {} to {} is not supported yet",
             in_ext, target_format
