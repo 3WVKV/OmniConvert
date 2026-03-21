@@ -4,7 +4,8 @@
     "pdfMerge": "PDF Merge",
     "pdfSignature": "PDF Signature",
     "pdfToolkit": "PDF Toolkit",
-    "ocr": "OCR"
+    "ocr": "OCR",
+    "videoTools": "Video Tools"
   },
   "converter": {
     "title": "Universal Converter",
@@ -93,10 +94,47 @@
     "copied": "Copied!",
     "exportTxt": "Export TXT",
     "exportMd": "Export Markdown",
-    "noText": "No text extracted"
+    "noText": "No text extracted",
+    "pdfRenderHint": "Pages will be rendered as images for OCR"
+  },
+  "videoTools": {
+    "title": "Video Tools",
+    "description": "Edit, trim, compress, and manipulate videos with FFmpeg",
+    "loadVideo": "Load Video",
+    "dropzone": "Drop a video file here",
+    "trim": "Trim",
+    "merge": "Merge",
+    "extractAudio": "Extract Audio",
+    "resize": "Resize",
+    "compress": "Compress",
+    "toGif": "To GIF",
+    "rotate": "Rotate",
+    "removeAudio": "Remove Audio",
+    "thumbnail": "Thumbnail",
+    "startTime": "Start time",
+    "endTime": "End time",
+    "timeFormat": "HH:MM:SS",
+    "width": "Width",
+    "height": "Height",
+    "crf": "Quality (CRF)",
+    "crfHint": "Lower = better quality (18-28 recommended)",
+    "fps": "FPS",
+    "gifWidth": "GIF width (px)",
+    "rotation90": "90° clockwise",
+    "rotation180": "180°",
+    "rotation270": "90° counter-clockwise",
+    "frameTime": "Frame time",
+    "addVideos": "Add Videos",
+    "process": "Process",
+    "processing": "Processing...",
+    "videoInfo": "Video Info",
+    "duration": "Duration",
+    "resolution": "Resolution",
+    "codec": "Codec"
   },
   "errors": {
     "tesseractNotInstalled": "Tesseract OCR is not installed. Download it from: https://github.com/UB-Mannheim/tesseract/wiki then restart the app.",
+    "tesseractLangNotAvailable": "The selected language data is not installed in Tesseract. Install the language pack (e.g. fra.traineddata) in your Tesseract tessdata folder.",
     "ffmpegNotInstalled": "ffmpeg is not installed. Download it from: https://ffmpeg.org/download.html then add it to your PATH and restart the app."
   },
   "common": {

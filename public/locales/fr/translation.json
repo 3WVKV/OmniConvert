@@ -4,7 +4,8 @@
     "pdfMerge": "Fusion PDF",
     "pdfSignature": "Signature PDF",
     "pdfToolkit": "Outils PDF",
-    "ocr": "OCR"
+    "ocr": "OCR",
+    "videoTools": "Outils Vidéo"
   },
   "converter": {
     "title": "Convertisseur universel",
@@ -93,10 +94,47 @@
     "copied": "Copié !",
     "exportTxt": "Exporter en TXT",
     "exportMd": "Exporter en Markdown",
-    "noText": "Aucun texte extrait"
+    "noText": "Aucun texte extrait",
+    "pdfRenderHint": "Les pages seront converties en images pour l'OCR"
+  },
+  "videoTools": {
+    "title": "Outils Vidéo",
+    "description": "Éditer, découper, compresser et manipuler des vidéos avec FFmpeg",
+    "loadVideo": "Charger une vidéo",
+    "dropzone": "Glissez un fichier vidéo ici",
+    "trim": "Découper",
+    "merge": "Fusionner",
+    "extractAudio": "Extraire audio",
+    "resize": "Redimensionner",
+    "compress": "Compresser",
+    "toGif": "Vers GIF",
+    "rotate": "Pivoter",
+    "removeAudio": "Suppr. audio",
+    "thumbnail": "Miniature",
+    "startTime": "Début",
+    "endTime": "Fin",
+    "timeFormat": "HH:MM:SS",
+    "width": "Largeur",
+    "height": "Hauteur",
+    "crf": "Qualité (CRF)",
+    "crfHint": "Plus bas = meilleure qualité (18-28 recommandé)",
+    "fps": "IPS",
+    "gifWidth": "Largeur GIF (px)",
+    "rotation90": "90° horaire",
+    "rotation180": "180°",
+    "rotation270": "90° anti-horaire",
+    "frameTime": "Temps de la frame",
+    "addVideos": "Ajouter des vidéos",
+    "process": "Traiter",
+    "processing": "Traitement en cours...",
+    "videoInfo": "Info vidéo",
+    "duration": "Durée",
+    "resolution": "Résolution",
+    "codec": "Codec"
   },
   "errors": {
     "tesseractNotInstalled": "Tesseract OCR n'est pas installé. Téléchargez-le ici : https://github.com/UB-Mannheim/tesseract/wiki puis redémarrez l'application.",
+    "tesseractLangNotAvailable": "Les données de langue sélectionnée ne sont pas installées dans Tesseract. Installez le pack de langue (ex: fra.traineddata) dans le dossier tessdata de Tesseract.",
     "ffmpegNotInstalled": "ffmpeg n'est pas installé. Téléchargez-le ici : https://ffmpeg.org/download.html puis ajoutez-le au PATH et redémarrez l'application."
   },
   "common": {

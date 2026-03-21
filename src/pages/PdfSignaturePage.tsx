@@ -61,7 +61,7 @@ export function PdfSignaturePage() {
   const renderPage = useCallback(async (base64: string, page: number) => {
     setLoadingPage(true);
     try {
-      const dataUrl = await renderPdfPageToBase64(base64, page);
+      const dataUrl = await renderPdfPageToBase64(base64, page, 2.0);
       setPageImageSrc(dataUrl);
     } catch {
       setPageImageSrc(null);
@@ -346,7 +346,7 @@ export function PdfSignaturePage() {
                     ref={imgRef}
                     src={pageImageSrc}
                     alt="PDF page"
-                    className="max-w-full max-h-[70vh] select-none"
+                    className="max-w-full select-none"
                     draggable={false}
                   />
                   {/* Signature overlay */}

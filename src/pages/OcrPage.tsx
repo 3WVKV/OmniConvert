@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { ScanText, Copy, FileText, FileCode, Loader2, Check } from "lucide-react";
+import { renderPdfPageToBase64 } from "@/lib/pdfRenderer";
 import type { OcrLanguage } from "@/types/ocr";
 import { toast } from "sonner";
 
@@ -17,6 +18,7 @@ export function OcrPage() {
 
   const [filePath, setFilePath] = useState<string | null>(null);
   const [fileName, setFileName] = useState("");
+  const [fileExt, setFileExt] = useState("");
   const [language, setLanguage] = useState<OcrLanguage>("eng");
   const [extractedText, setExtractedText] = useState("");
   const [extracting, setExtracting] = useState(false);
@@ -29,6 +31,7 @@ export function OcrPage() {
       const fileInfo = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
       setFilePath(path);
       setFileName(fileInfo.name);
+      setFileExt(fileInfo.extension.toLowerCase());
       setExtractedText("");
     } catch (err) {
       toast.error(String(err));
@@ -39,18 +42,48 @@ export function OcrPage() {
     if (!filePath) return;
     setExtracting(true);
     try {
-      const result = await invoke<{ text: string; confidence: number }>("ocr_extract", {
-        path: filePath,
-        language,
-      });
-      setExtractedText(result.text);
-      if (!result.text) {
-        toast.info(t("ocr.noText"));
+      if (fileExt === "pdf") {
+        // For PDFs: render each page to image, then OCR the images
+        const pdfInfo = await invoke<{ page_count: number; file_size: number }>("get_pdf_info", { path: filePath });
+        const pdfBase64 = await invoke<string>("read_file_base64", { path: filePath });
+        let allText = "";
+
+        for (let page = 1; page <= pdfInfo.page_count; page++) {
+          const dataUrl = await renderPdfPageToBase64(pdfBase64, page, 2.5);
+          // Send rendered image to backend OCR
+          const result = await invoke<{ text: string; confidence: number }>("ocr_extract_base64", {
+            imageBase64: dataUrl,
+            language,
+          });
+          if (result.text.trim()) {
+            if (pdfInfo.page_count > 1) {
+              allText += `--- ${t("pdfSignature.page")} ${page} ---\n`;
+            }
+            allText += result.text + "\n";
+          }
+        }
+
+        setExtractedText(allText.trim());
+        if (!allText.trim()) {
+          toast.info(t("ocr.noText"));
+        }
+      } else {
+        // For images: use direct file path OCR
+        const result = await invoke<{ text: string; confidence: number }>("ocr_extract", {
+          path: filePath,
+          language,
+        });
+        setExtractedText(result.text);
+        if (!result.text) {
+          toast.info(t("ocr.noText"));
+        }
       }
     } catch (err) {
       const msg = String(err);
       if (msg.includes("TESSERACT_NOT_INSTALLED")) {
         toast.error(t("errors.tesseractNotInstalled"));
+      } else if (msg.includes("TESSERACT_LANG_NOT_AVAILABLE")) {
+        toast.error(t("errors.tesseractLangNotAvailable"));
       } else {
         toast.error(msg);
       }
@@ -105,7 +138,10 @@ export function OcrPage() {
           <div className="flex w-64 shrink-0 flex-col gap-4 rounded-lg border bg-card p-4">
             <div className="space-y-1">
               <p className="text-sm font-medium truncate">{fileName}</p>
-              <Button variant="ghost" size="sm" onClick={() => { setFilePath(null); setExtractedText(""); }}>
+              {fileExt === "pdf" && (
+                <p className="text-xs text-muted-foreground">PDF → {t("ocr.pdfRenderHint")}</p>
+              )}
+              <Button variant="ghost" size="sm" onClick={() => { setFilePath(null); setExtractedText(""); setFileExt(""); }}>
                 {t("common.close")}
               </Button>
             </div>
