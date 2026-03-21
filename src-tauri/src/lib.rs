@@ -951,18 +951,56 @@ fn convert_to_pdf(input: &str, output: &str) -> Result<String, String> {
             // Create a simple text PDF
             let mut doc = lopdf::Document::with_version("1.5");
 
-            // Split text into lines and pages (roughly 50 lines per page at 12pt)
-            let lines: Vec<&str> = plain_text.lines().collect();
-            let lines_per_page = 50;
-            let page_w: i64 = 612; // US Letter
-            let page_h: i64 = 792;
+            let page_w: i64 = 595; // A4
+            let page_h: i64 = 842;
             let margin = 50.0;
             let line_height = 14.0;
-            let font_size = 11.0;
+            let font_size = 10.0;
+            let usable_width = page_w as f64 - 2.0 * margin;
+            // Average char width for Helvetica at 10pt ≈ 5.5 points
+            let avg_char_width = font_size * 0.52;
+            let max_chars_per_line = (usable_width / avg_char_width) as usize;
+            let lines_per_page = ((page_h as f64 - 2.0 * margin) / line_height) as usize;
+
+            // Word-wrap all lines
+            let raw_lines: Vec<&str> = plain_text.lines().collect();
+            let mut wrapped_lines: Vec<String> = Vec::new();
+            for line in &raw_lines {
+                if line.len() <= max_chars_per_line {
+                    wrapped_lines.push(line.to_string());
+                } else {
+                    // Word wrap
+                    let words: Vec<&str> = line.split_whitespace().collect();
+                    let mut current_line = String::new();
+                    for word in words {
+                        if current_line.is_empty() {
+                            if word.len() > max_chars_per_line {
+                                // Force-break very long words
+                                let mut remaining = word;
+                                while remaining.len() > max_chars_per_line {
+                                    let (part, rest) = remaining.split_at(max_chars_per_line);
+                                    wrapped_lines.push(part.to_string());
+                                    remaining = rest;
+                                }
+                                current_line = remaining.to_string();
+                            } else {
+                                current_line = word.to_string();
+                            }
+                        } else if current_line.len() + 1 + word.len() <= max_chars_per_line {
+                            current_line.push(' ');
+                            current_line.push_str(word);
+                        } else {
+                            wrapped_lines.push(current_line);
+                            current_line = word.to_string();
+                        }
+                    }
+                    wrapped_lines.push(current_line);
+                }
+            }
 
             let mut page_ids: Vec<lopdf::ObjectId> = Vec::new();
 
-            for chunk in lines.chunks(lines_per_page) {
+            for chunk in wrapped_lines.chunks(lines_per_page) {
                 // Build content stream as raw bytes for WinAnsi encoding
                 let mut content_bytes: Vec<u8> = Vec::new();
                 content_bytes.extend_from_slice(format!("BT\n/F1 {} Tf\n", font_size).as_bytes());
@@ -1357,7 +1395,7 @@ fn find_magick() -> String {
     }
 }
 
-/// Extract text from PDF: try pdftotext first, fallback to lopdf
+/// Extract text from PDF: try pdftotext first, fallback to lopdf, then OCR
 fn extract_pdf_text(input: &str) -> Result<String, String> {
     // Try pdftotext (poppler-utils) first — much better extraction
     if let Ok(output) = Command::new("pdftotext")
@@ -1386,12 +1424,72 @@ fn extract_pdf_text(input: &str) -> Result<String, String> {
         }
     }
 
-    // Last resort: try ImageMagick's identify to check if it's image-based
-    if text.trim().is_empty() {
-        return Ok("(No extractable text found in PDF — the document may contain scanned images. Use OCR to extract text.)".to_string());
+    if !text.trim().is_empty() {
+        return Ok(text);
     }
 
-    Ok(text)
+    // Last resort: OCR via Tesseract
+    // First convert PDF to image, then OCR
+    let magick = find_magick();
+    let temp_img = std::env::temp_dir().join(format!("omni_pdf_ocr_{}.png", std::process::id()));
+    let temp_img_str = temp_img.to_string_lossy().to_string();
+
+    // Try ImageMagick to render PDF page to image
+    let img_result = Command::new(&magick)
+        .arg("-density").arg("300")
+        .arg(format!("{}[0]", input))
+        .arg("-depth").arg("8")
+        .arg(&temp_img_str)
+        .output();
+
+    let has_image = match img_result {
+        Ok(o) if o.status.success() && temp_img.exists() => true,
+        _ => {
+            // Try pdftoppm fallback
+            let temp_prefix = std::env::temp_dir().join(format!("omni_pdf_ocr_{}", std::process::id()));
+            let r = Command::new("pdftoppm")
+                .arg("-png").arg("-f").arg("1").arg("-l").arg("1")
+                .arg("-singlefile").arg("-r").arg("300")
+                .arg(input)
+                .arg(temp_prefix.to_string_lossy().to_string())
+                .output();
+            match r {
+                Ok(o) if o.status.success() => {
+                    let expected = format!("{}.png", temp_prefix.to_string_lossy());
+                    if Path::new(&expected).exists() {
+                        let _ = fs::rename(&expected, &temp_img_str);
+                        true
+                    } else { false }
+                }
+                _ => false,
+            }
+        }
+    };
+
+    if has_image {
+        // Run Tesseract OCR on the image
+        let tesseract = if cfg!(windows) { "tesseract" } else { "tesseract" };
+        // Try French first, then English, then no language specified
+        for lang in &["fra+eng", "eng", ""] {
+            let mut cmd = Command::new(tesseract);
+            cmd.arg(&temp_img_str).arg("stdout");
+            if !lang.is_empty() {
+                cmd.arg("-l").arg(lang);
+            }
+            if let Ok(output) = cmd.output() {
+                if output.status.success() {
+                    let ocr_text = String::from_utf8_lossy(&output.stdout).to_string();
+                    let _ = fs::remove_file(&temp_img);
+                    if !ocr_text.trim().is_empty() {
+                        return Ok(ocr_text);
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(&temp_img);
+    }
+
+    Ok("(No extractable text found in PDF — the document may contain scanned images. Install Tesseract and ImageMagick for OCR extraction.)".to_string())
 }
 
 fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
