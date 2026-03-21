@@ -1867,24 +1867,16 @@ fn compress_pdf(input_path: String, output_path: String, quality: String) -> Res
     // 2. Compress/downscale embedded images
     let object_ids: Vec<lopdf::ObjectId> = doc.objects.keys().cloned().collect();
     for id in object_ids {
-        let is_image = {
+        // Check if this object is an image stream
+        let image_info = {
             if let Ok(Object::Stream(ref stream)) = doc.get_object(id) {
                 let dict = &stream.dict;
-                if let Ok(Object::Name(ref subtype)) = dict.get(b"Subtype") {
-                    subtype == b"Image"
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        if is_image {
-            // Get image info
-            let (width, height, has_smask, colorspace_is_rgb) = {
-                if let Ok(Object::Stream(ref stream)) = doc.get_object(id) {
-                    let dict = &stream.dict;
+                let is_image = match dict.get(b"Subtype") {
+                    Ok(Object::Name(ref s)) => s == b"Image",
+                    _ => false,
+                };
+                if !is_image { None }
+                else {
                     let w = match dict.get(b"Width") {
                         Ok(Object::Integer(n)) => *n as u32,
                         _ => continue,
@@ -1893,76 +1885,108 @@ fn compress_pdf(input_path: String, output_path: String, quality: String) -> Res
                         Ok(Object::Integer(n)) => *n as u32,
                         _ => continue,
                     };
-                    let has_smask = dict.get(b"SMask").is_ok();
-                    let is_rgb = match dict.get(b"ColorSpace") {
-                        Ok(Object::Name(ref cs)) => cs == b"DeviceRGB",
-                        _ => false,
+                    // Detect current filter (compression type)
+                    let filter = match dict.get(b"Filter") {
+                        Ok(Object::Name(ref f)) => String::from_utf8_lossy(f).to_string(),
+                        Ok(Object::Array(ref arr)) => {
+                            if let Some(Object::Name(ref f)) = arr.last() {
+                                String::from_utf8_lossy(f).to_string()
+                            } else { String::new() }
+                        }
+                        _ => String::new(),
                     };
-                    (w, h, has_smask, is_rgb)
-                } else {
-                    continue;
+                    let channels = match dict.get(b"ColorSpace") {
+                        Ok(Object::Name(ref cs)) if cs == b"DeviceGray" => 1u32,
+                        Ok(Object::Name(ref cs)) if cs == b"DeviceCMYK" => 4u32,
+                        _ => 3u32, // Default to RGB
+                    };
+                    Some((w, h, filter, channels))
                 }
-            };
+            } else { None }
+        };
 
-            // Only process RGB images without SMask (transparency complicates things)
-            if !colorspace_is_rgb || has_smask {
-                continue;
-            }
+        let (width, height, filter, channels) = match image_info {
+            Some(info) => info,
+            None => continue,
+        };
 
-            // Get decompressed pixel data
+        // Get the raw stream content
+        let raw_data = {
+            if let Ok(Object::Stream(ref stream)) = doc.get_object(id) {
+                stream.content.clone()
+            } else { continue; }
+        };
+
+        // Try to decode the image data into a DynamicImage
+        let img: Option<image::DynamicImage> = if filter == "DCTDecode" {
+            // Already JPEG — decode it with image crate
+            image::load_from_memory_with_format(&raw_data, ImageFormat::Jpeg).ok()
+        } else {
+            // Try decompressing (FlateDecode etc.) then interpreting as raw pixels
             let pixel_data = {
                 if let Ok(Object::Stream(ref mut stream)) = doc.get_object_mut(id) {
                     let _ = stream.decompress();
                     stream.content.clone()
+                } else { continue; }
+            };
+            let expected = (width * height * channels) as usize;
+            if pixel_data.len() == expected {
+                if channels == 3 {
+                    image::RgbImage::from_raw(width, height, pixel_data)
+                        .map(image::DynamicImage::ImageRgb8)
+                } else if channels == 1 {
+                    image::GrayImage::from_raw(width, height, pixel_data)
+                        .map(image::DynamicImage::ImageLuma8)
                 } else {
-                    continue;
+                    None // CMYK etc. — skip
                 }
-            };
-
-            let expected_len = (width * height * 3) as usize;
-            if pixel_data.len() != expected_len {
-                continue; // Not raw RGB data
-            }
-
-            // Reconstruct image with image crate
-            let img_buf = match image::RgbImage::from_raw(width, height, pixel_data) {
-                Some(buf) => buf,
-                None => continue,
-            };
-            let img = image::DynamicImage::ImageRgb8(img_buf);
-
-            // Resize if larger than max_dim
-            let resized = if width > max_dim || height > max_dim {
-                img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
             } else {
-                img
-            };
+                // Maybe it's a PNG or other format in the stream
+                image::load_from_memory(&pixel_data).ok()
+            }
+        };
 
-            // Re-encode as JPEG
-            let new_w = resized.width();
-            let new_h = resized.height();
-            let mut jpeg_buf = Vec::new();
+        let img = match img {
+            Some(i) => i,
+            None => continue,
+        };
+
+        // Resize if larger than max_dim
+        let resized = if img.width() > max_dim || img.height() > max_dim {
+            img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+
+        // Re-encode as JPEG at target quality
+        let new_w = resized.width();
+        let new_h = resized.height();
+        let mut jpeg_buf = Vec::new();
+        {
             let mut cursor = std::io::Cursor::new(&mut jpeg_buf);
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, img_quality);
-            resized.write_with_encoder(encoder).unwrap_or_else(|_| ());
-
-            if jpeg_buf.is_empty() {
+            if resized.write_with_encoder(encoder).is_err() {
                 continue;
             }
+        }
 
-            // Replace the stream with JPEG data
-            if let Ok(Object::Stream(ref mut stream)) = doc.get_object_mut(id) {
-                stream.dict.set("Width", Object::Integer(new_w as i64));
-                stream.dict.set("Height", Object::Integer(new_h as i64));
-                stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
-                stream.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
-                stream.dict.set("BitsPerComponent", Object::Integer(8));
-                stream.dict.set("Length", Object::Integer(jpeg_buf.len() as i64));
-                // Remove old compression filter entries
-                stream.dict.remove(b"DecodeParms");
-                stream.content = jpeg_buf;
-                stream.allows_compression = false; // Already JPEG compressed
-            }
+        // Only replace if new JPEG is actually smaller
+        if jpeg_buf.is_empty() || jpeg_buf.len() >= raw_data.len() {
+            continue;
+        }
+
+        // Replace the stream with JPEG data
+        if let Ok(Object::Stream(ref mut stream)) = doc.get_object_mut(id) {
+            stream.dict.set("Width", Object::Integer(new_w as i64));
+            stream.dict.set("Height", Object::Integer(new_h as i64));
+            stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+            stream.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+            stream.dict.set("BitsPerComponent", Object::Integer(8));
+            stream.dict.set("Length", Object::Integer(jpeg_buf.len() as i64));
+            stream.dict.remove(b"DecodeParms");
+            stream.dict.remove(b"SMask");
+            stream.content = jpeg_buf;
+            stream.allows_compression = false; // Already JPEG
         }
     }
 
