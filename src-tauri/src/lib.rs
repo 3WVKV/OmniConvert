@@ -1275,6 +1275,133 @@ fn convert_archive(input: &str, output: &str) -> Result<String, String> {
     }
 }
 
+// ─── PDF as source conversion ───────────────────────────────────────
+
+fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
+    let out_ext = Path::new(output).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    match out_ext.as_str() {
+        // PDF → text-based formats: extract text then convert
+        "txt" | "md" | "html" | "rtf" | "docx" => {
+            let doc = lopdf::Document::load(input)
+                .map_err(|e| format!("PDF load error: {}", e))?;
+            let mut text = String::new();
+            let pages = doc.get_pages();
+            for page_num in 1..=pages.len() as u32 {
+                if let Ok(page_text) = doc.extract_text(&[page_num]) {
+                    text.push_str(&page_text);
+                    text.push('\n');
+                }
+            }
+            if text.trim().is_empty() {
+                text = "(No extractable text found in PDF — the document may contain scanned images. Use OCR to extract text.)".to_string();
+            }
+
+            match out_ext.as_str() {
+                "txt" | "md" => {
+                    fs::write(output, &text).map_err(|e| format!("Write error: {}", e))?;
+                    Ok(output.to_string())
+                }
+                "html" => {
+                    let title = Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document");
+                    let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                    let html = format!(
+                        "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<pre>{}</pre>\n</body>\n</html>",
+                        title, escaped
+                    );
+                    fs::write(output, &html).map_err(|e| format!("Write error: {}", e))?;
+                    Ok(output.to_string())
+                }
+                "rtf" => {
+                    let mut rtf = String::from("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Calibri;}}\n");
+                    for line in text.lines() {
+                        let escaped: String = line.chars().map(|c| match c {
+                            '\\' => "\\\\".to_string(),
+                            '{' => "\\{".to_string(),
+                            '}' => "\\}".to_string(),
+                            c if (c as u32) > 127 => format!("\\u{}?", c as i16),
+                            c => c.to_string(),
+                        }).collect();
+                        rtf.push_str(&escaped);
+                        rtf.push_str("\\par\n");
+                    }
+                    rtf.push('}');
+                    fs::write(output, &rtf).map_err(|e| format!("Write error: {}", e))?;
+                    Ok(output.to_string())
+                }
+                "docx" => create_docx_from_text(&text, output),
+                _ => unreachable!(),
+            }
+        }
+        // PDF → image formats: use poppler/pdftoppm or fallback message
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" => {
+            // Try using pdftoppm (poppler-utils) or magick (ImageMagick)
+            let pdftoppm = if cfg!(windows) { "pdftoppm" } else { "pdftoppm" };
+            let temp_prefix = std::env::temp_dir().join(format!("omni_pdf2img_{}", std::process::id()));
+            let temp_prefix_str = temp_prefix.to_string_lossy().to_string();
+
+            let fmt_flag = match out_ext.as_str() {
+                "jpg" | "jpeg" => "-jpeg",
+                "png" => "-png",
+                "tiff" => "-tiff",
+                _ => "-png",
+            };
+
+            // pdftoppm: convert first page
+            let result = Command::new(pdftoppm)
+                .arg(fmt_flag)
+                .arg("-f").arg("1").arg("-l").arg("1")
+                .arg("-singlefile")
+                .arg(input)
+                .arg(&temp_prefix_str)
+                .output();
+
+            match result {
+                Ok(out) if out.status.success() => {
+                    // Find the generated file
+                    let expected_ext = match out_ext.as_str() {
+                        "jpg" | "jpeg" => "jpg",
+                        "tiff" => "tif",
+                        _ => "png",
+                    };
+                    let temp_file = format!("{}.{}", temp_prefix_str, expected_ext);
+                    if Path::new(&temp_file).exists() {
+                        // If target format differs from pdftoppm output, convert with image crate
+                        if out_ext == "webp" || out_ext == "bmp" {
+                            let img = image::open(&temp_file).map_err(|e| format!("Image open: {}", e))?;
+                            let fmt = match out_ext.as_str() {
+                                "webp" => ImageFormat::WebP,
+                                "bmp" => ImageFormat::Bmp,
+                                _ => ImageFormat::Png,
+                            };
+                            img.save_with_format(output, fmt).map_err(|e| format!("Image save: {}", e))?;
+                        } else {
+                            fs::copy(&temp_file, output).map_err(|e| format!("Copy: {}", e))?;
+                        }
+                        let _ = fs::remove_file(&temp_file);
+                        Ok(output.to_string())
+                    } else {
+                        Err("PDF to image: generated file not found".to_string())
+                    }
+                }
+                _ => {
+                    // Fallback: try ImageMagick's magick/convert
+                    let magick = if cfg!(windows) { "magick" } else { "convert" };
+                    let result = Command::new(magick)
+                        .arg(format!("{}[0]", input)) // first page
+                        .arg(output)
+                        .output();
+                    match result {
+                        Ok(out) if out.status.success() => Ok(output.to_string()),
+                        _ => Err("PDF to image requires poppler-utils (pdftoppm) or ImageMagick (magick). Please install one of them.".to_string()),
+                    }
+                }
+            }
+        }
+        _ => Err(format!("PDF conversion to {} is not supported yet", out_ext)),
+    }
+}
+
 // ─── Tauri Commands ────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1299,6 +1426,7 @@ fn convert_file(
         "csv" | "json" | "xml" | "yaml" | "yml" | "xls" | "xlsx" | "ods" => "data",
         "txt" | "md" | "html" | "rtf" | "docx" => "text",
         "zip" | "rar" | "7z" | "tar" | "gz" => "archive",
+        "pdf" => "pdf",
         _ => "unknown",
     };
 
@@ -1341,6 +1469,7 @@ fn convert_file(
         "data" => convert_data(&input_path, &output_path),
         "text" => convert_text(&input_path, &output_path),
         "archive" => convert_archive(&input_path, &output_path),
+        "pdf" => convert_from_pdf(&input_path, &output_path),
         _ => Err(format!(
             "Conversion from {} to {} is not supported yet",
             in_ext, target_format

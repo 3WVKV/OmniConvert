@@ -53,6 +53,10 @@ export const conversionMatrix: Record<string, string[]> = {
   ),
   // RAR is read-only (no RAR creation), can convert to other archives
   rar: archiveFormats.filter((f) => f !== "rar"),
+
+  // ─── PDF (as source) ─────────────────────────────────────
+  // PDF can be converted to text/document formats and images
+  pdf: ["txt", "md", "html", "rtf", "docx", "jpg", "png", "webp", "bmp", "tiff"],
 };
 
 export function getTargetFormats(sourceExtension: string): string[] {
