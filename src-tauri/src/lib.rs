@@ -902,6 +902,152 @@ fn convert_archive(input: &str, output: &str) -> Result<String, String> {
             zip_writer.finish().map_err(|e| format!("ZIP finish: {}", e))?;
             Ok(output.to_string())
         }
+        // 7Z → ZIP
+        ("7z", "zip") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            sevenz_rust::decompress_file(input, &temp_dir)
+                .map_err(|e| format!("7z decompress: {}", e))?;
+            // Collect all extracted files into a ZIP
+            let zip_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut zip_writer = zip::ZipWriter::new(zip_file);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            fn add_dir_to_zip(zip_writer: &mut zip::ZipWriter<fs::File>, dir: &Path, base: &Path, options: zip::write::SimpleFileOptions) -> Result<(), String> {
+                for entry in fs::read_dir(dir).map_err(|e| format!("Read dir: {}", e))? {
+                    let entry = entry.map_err(|e| format!("Dir entry: {}", e))?;
+                    let path = entry.path();
+                    let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    if path.is_dir() {
+                        add_dir_to_zip(zip_writer, &path, base, options)?;
+                    } else {
+                        let data = fs::read(&path).map_err(|e| format!("Read: {}", e))?;
+                        zip_writer.start_file(&rel, options).map_err(|e| format!("ZIP: {}", e))?;
+                        std::io::Write::write_all(zip_writer, &data).map_err(|e| format!("Write: {}", e))?;
+                    }
+                }
+                Ok(())
+            }
+            add_dir_to_zip(&mut zip_writer, &temp_dir, &temp_dir, options)?;
+            zip_writer.finish().map_err(|e| format!("ZIP finish: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // 7Z → TAR
+        ("7z", "tar") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            sevenz_rust::decompress_file(input, &temp_dir)
+                .map_err(|e| format!("7z decompress: {}", e))?;
+            let tar_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut tar_builder = tar::Builder::new(tar_file);
+            fn add_dir_to_tar(builder: &mut tar::Builder<fs::File>, dir: &Path, base: &Path) -> Result<(), String> {
+                for entry in fs::read_dir(dir).map_err(|e| format!("Read dir: {}", e))? {
+                    let entry = entry.map_err(|e| format!("Dir entry: {}", e))?;
+                    let path = entry.path();
+                    let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    if path.is_dir() {
+                        add_dir_to_tar(builder, &path, base)?;
+                    } else {
+                        let data = fs::read(&path).map_err(|e| format!("Read: {}", e))?;
+                        let mut header = tar::Header::new_gnu();
+                        header.set_size(data.len() as u64);
+                        header.set_mode(0o644);
+                        header.set_cksum();
+                        builder.append_data(&mut header, &rel, &data[..])
+                            .map_err(|e| format!("TAR append: {}", e))?;
+                    }
+                }
+                Ok(())
+            }
+            add_dir_to_tar(&mut tar_builder, &temp_dir, &temp_dir)?;
+            tar_builder.finish().map_err(|e| format!("TAR finish: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // 7Z → GZ (tar.gz)
+        ("7z", "gz") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            sevenz_rust::decompress_file(input, &temp_dir)
+                .map_err(|e| format!("7z decompress: {}", e))?;
+            let gz_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+            let mut tar_builder = tar::Builder::new(encoder);
+            fn add_dir_to_targz<W: std::io::Write>(builder: &mut tar::Builder<W>, dir: &Path, base: &Path) -> Result<(), String> {
+                for entry in fs::read_dir(dir).map_err(|e| format!("Read dir: {}", e))? {
+                    let entry = entry.map_err(|e| format!("Dir entry: {}", e))?;
+                    let path = entry.path();
+                    let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    if path.is_dir() {
+                        add_dir_to_targz(builder, &path, base)?;
+                    } else {
+                        let data = fs::read(&path).map_err(|e| format!("Read: {}", e))?;
+                        let mut header = tar::Header::new_gnu();
+                        header.set_size(data.len() as u64);
+                        header.set_mode(0o644);
+                        header.set_cksum();
+                        builder.append_data(&mut header, &rel, &data[..])
+                            .map_err(|e| format!("TAR append: {}", e))?;
+                    }
+                }
+                Ok(())
+            }
+            add_dir_to_targz(&mut tar_builder, &temp_dir, &temp_dir)?;
+            tar_builder.into_inner().map_err(|e| format!("GZ finish: {}", e))?
+                .finish().map_err(|e| format!("GZ finish: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // ZIP → 7Z
+        ("zip", "7z") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_to7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i).map_err(|e| format!("ZIP entry: {}", e))?;
+                let out_path = temp_dir.join(entry.name());
+                if entry.is_dir() {
+                    fs::create_dir_all(&out_path).map_err(|e| format!("Dir: {}", e))?;
+                } else {
+                    if let Some(parent) = out_path.parent() {
+                        fs::create_dir_all(parent).map_err(|e| format!("Dir: {}", e))?;
+                    }
+                    let mut data = Vec::new();
+                    std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                    fs::write(&out_path, data).map_err(|e| format!("Write: {}", e))?;
+                }
+            }
+            sevenz_rust::compress_to_path(&temp_dir, output)
+                .map_err(|e| format!("7z compress: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // TAR → 7Z
+        ("tar", "7z") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_to7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut archive = tar::Archive::new(file);
+            archive.unpack(&temp_dir).map_err(|e| format!("TAR unpack: {}", e))?;
+            sevenz_rust::compress_to_path(&temp_dir, output)
+                .map_err(|e| format!("7z compress: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // GZ → 7Z
+        ("gz", "7z") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_to7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            let gz_file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let decoder = flate2::read::GzDecoder::new(gz_file);
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(&temp_dir).map_err(|e| format!("GZ/TAR unpack: {}", e))?;
+            sevenz_rust::compress_to_path(&temp_dir, output)
+                .map_err(|e| format!("7z compress: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
         _ => Err(format!("Conversion from {} to {} is not supported yet", in_ext, out_ext)),
     }
 }
