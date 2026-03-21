@@ -1,60 +1,58 @@
 /** Maps source extension to list of valid target extensions */
+
+const imageFormats = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "avif", "heic", "ico", "svg"];
+const audioFormats = ["mp3", "wav", "flac", "aac", "ogg", "m4a", "opus"];
+const videoFormats = ["mp4", "mov", "mkv", "avi", "webm", "flv", "mpeg", "mpg"];
+const docFormats = ["txt", "md", "html", "rtf", "docx"];
+const dataFormats = ["csv", "json", "xml", "yaml", "xlsx", "xls", "ods"];
+const archiveFormats = ["zip", "tar", "gz", "7z"];
+
+function allExcept(formats: string[], self: string): string[] {
+  return formats.filter((f) => f !== self);
+}
+
 export const conversionMatrix: Record<string, string[]> = {
-  // Images
-  jpg: ["png", "webp", "gif", "bmp", "tiff", "avif", "ico", "pdf"],
-  jpeg: ["png", "webp", "gif", "bmp", "tiff", "avif", "ico", "pdf"],
-  png: ["jpg", "webp", "gif", "bmp", "tiff", "avif", "ico", "pdf"],
-  webp: ["jpg", "png", "gif", "bmp", "tiff", "avif", "ico", "pdf"],
-  gif: ["jpg", "png", "webp", "bmp", "tiff", "avif", "pdf"],
-  bmp: ["jpg", "png", "webp", "gif", "tiff", "avif", "ico", "pdf"],
-  tiff: ["jpg", "png", "webp", "gif", "bmp", "avif", "pdf"],
-  avif: ["jpg", "png", "webp", "gif", "bmp", "tiff", "pdf"],
-  heic: ["jpg", "png", "webp", "gif", "bmp", "tiff", "avif", "pdf"],
-  ico: ["png", "jpg", "webp", "bmp", "pdf"],
-  svg: ["png", "jpg", "webp", "pdf"],
+  // ─── Images ──────────────────────────────────────────────
+  // Every image format can convert to every other image format + PDF
+  ...Object.fromEntries(
+    imageFormats.map((fmt) => [fmt, [...allExcept(imageFormats, fmt), "pdf"]])
+  ),
 
-  // Documents
-  md: ["html", "txt", "pdf"],
-  html: ["txt", "md", "pdf"],
-  txt: ["md", "html", "pdf"],
-  rtf: ["txt", "pdf"],
-  docx: ["txt", "html", "md", "pdf"],
-  doc: ["txt", "pdf"],
+  // ─── Documents ───────────────────────────────────────────
+  // Every document format can convert to every other document format + PDF
+  ...Object.fromEntries(
+    docFormats.map((fmt) => [fmt, [...allExcept(docFormats, fmt), "pdf"]])
+  ),
+  // Also support doc (read-only, old Word)
+  doc: [...docFormats.filter((f) => f !== "doc"), "pdf"],
 
-  // Data
-  csv: ["json", "xml", "yaml", "xlsx"],
-  json: ["csv", "xml", "yaml"],
-  xml: ["json", "csv", "yaml"],
-  yaml: ["json", "csv", "xml"],
-  xls: ["csv", "json", "xml", "yaml", "xlsx"],
-  xlsx: ["csv", "json", "xml", "yaml"],
-  ods: ["csv", "json", "xml", "yaml", "xlsx"],
+  // ─── Data ────────────────────────────────────────────────
+  // Every data format can convert to every other data format
+  ...Object.fromEntries(
+    dataFormats.map((fmt) => [fmt, allExcept(dataFormats, fmt)])
+  ),
+  // yml alias
+  yml: allExcept(dataFormats, "yaml"),
 
-  // Audio
-  mp3: ["wav", "flac", "aac", "ogg", "m4a", "opus"],
-  wav: ["mp3", "flac", "aac", "ogg", "m4a", "opus"],
-  flac: ["mp3", "wav", "aac", "ogg", "m4a", "opus"],
-  aac: ["mp3", "wav", "flac", "ogg", "m4a", "opus"],
-  ogg: ["mp3", "wav", "flac", "aac", "m4a", "opus"],
-  m4a: ["mp3", "wav", "flac", "aac", "ogg", "opus"],
-  opus: ["mp3", "wav", "flac", "aac", "ogg", "m4a"],
+  // ─── Audio ───────────────────────────────────────────────
+  // Every audio format can convert to every other audio format
+  ...Object.fromEntries(
+    audioFormats.map((fmt) => [fmt, allExcept(audioFormats, fmt)])
+  ),
 
-  // Video
-  mp4: ["mov", "mkv", "avi", "webm", "flv", "mpeg"],
-  mov: ["mp4", "mkv", "avi", "webm", "flv", "mpeg"],
-  mkv: ["mp4", "mov", "avi", "webm", "flv", "mpeg"],
-  avi: ["mp4", "mov", "mkv", "webm", "flv", "mpeg"],
-  webm: ["mp4", "mov", "mkv", "avi", "flv", "mpeg"],
-  flv: ["mp4", "mov", "mkv", "avi", "webm", "mpeg"],
-  mpeg: ["mp4", "mov", "mkv", "avi", "webm", "flv"],
-  mpg: ["mp4", "mov", "mkv", "avi", "webm", "flv"],
+  // ─── Video ───────────────────────────────────────────────
+  // Every video format can convert to every other video format
+  ...Object.fromEntries(
+    videoFormats.map((fmt) => [fmt, allExcept(videoFormats, fmt)])
+  ),
 
-  // Archives
-  zip: ["tar", "gz", "7z"],
-  rar: ["zip", "tar", "gz", "7z"],
-  "7z": ["zip", "tar", "gz"],
-  tar: ["zip", "gz", "7z"],
-  gz: ["zip", "tar", "7z"],
+  // ─── Archives ────────────────────────────────────────────
+  // Every archive format can convert to every other archive format
+  ...Object.fromEntries(
+    archiveFormats.map((fmt) => [fmt, allExcept(archiveFormats, fmt)])
+  ),
+  // RAR is read-only (no RAR creation), can convert to other archives
+  rar: archiveFormats.filter((f) => f !== "rar"),
 };
 
 export function getTargetFormats(sourceExtension: string): string[] {

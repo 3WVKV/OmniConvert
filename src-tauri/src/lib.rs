@@ -358,6 +358,10 @@ fn convert_data(input: &str, output: &str) -> Result<String, String> {
             serde_json::Value::String(s) => s.clone(),
             _ => serde_json::to_string_pretty(&data).unwrap_or_default(),
         },
+        "xlsx" | "xls" | "ods" => {
+            // Write data as XLSX (minimal spreadsheet via ZIP + XML)
+            return create_xlsx_from_json(&data, output);
+        }
         _ => return Err(format!("Unsupported output data format: {}", out_ext)),
     };
 
@@ -365,61 +369,280 @@ fn convert_data(input: &str, output: &str) -> Result<String, String> {
     Ok(output.to_string())
 }
 
+/// Create a minimal .xlsx file from JSON data
+fn create_xlsx_from_json(data: &serde_json::Value, output: &str) -> Result<String, String> {
+    let file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    // [Content_Types].xml
+    zip.start_file("[Content_Types].xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // _rels/.rels
+    zip.start_file("_rels/.rels", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // xl/_rels/workbook.xml.rels
+    zip.start_file("xl/_rels/workbook.xml.rels", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // xl/workbook.xml
+    zip.start_file("xl/workbook.xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // xl/worksheets/sheet1.xml — build rows from JSON array
+    let mut sheet = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+"#);
+
+    if let serde_json::Value::Array(arr) = data {
+        // Extract headers from first object
+        if let Some(serde_json::Value::Object(first)) = arr.first() {
+            let headers: Vec<&String> = first.keys().collect();
+            // Header row
+            sheet.push_str("    <row r=\"1\">");
+            for (i, h) in headers.iter().enumerate() {
+                let col = (b'A' + i as u8) as char;
+                let escaped = h.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                sheet.push_str(&format!("<c r=\"{}1\" t=\"inlineStr\"><is><t>{}</t></is></c>", col, escaped));
+            }
+            sheet.push_str("</row>\n");
+            // Data rows
+            for (row_idx, item) in arr.iter().enumerate() {
+                if let serde_json::Value::Object(obj) = item {
+                    let row_num = row_idx + 2;
+                    sheet.push_str(&format!("    <row r=\"{}\">", row_num));
+                    for (i, h) in headers.iter().enumerate() {
+                        let col = (b'A' + i as u8) as char;
+                        let val = obj.get(*h).map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        }).unwrap_or_default();
+                        let escaped = val.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                        sheet.push_str(&format!("<c r=\"{}{}\" t=\"inlineStr\"><is><t>{}</t></is></c>", col, row_num, escaped));
+                    }
+                    sheet.push_str("</row>\n");
+                }
+            }
+        }
+    }
+
+    sheet.push_str("  </sheetData>\n</worksheet>");
+
+    zip.start_file("xl/worksheets/sheet1.xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, sheet.as_bytes()).map_err(|e| format!("Write: {}", e))?;
+
+    zip.finish().map_err(|e| format!("ZIP finish: {}", e))?;
+    Ok(output.to_string())
+}
+
 // ─── Text/document conversion ──────────────────────────────────────
 
 fn convert_text(input: &str, output: &str) -> Result<String, String> {
-    let content = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
     let in_ext = Path::new(input).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     let out_ext = Path::new(output).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let title = Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document");
 
-    let result = match (in_ext.as_str(), out_ext.as_str()) {
-        ("md", "html") | ("txt", "html") => {
-            // Wrap in proper HTML so the file renders correctly in a browser
-            let escaped = content
+    // Step 1: Extract plain text from any input format
+    let plain_text = match in_ext.as_str() {
+        "docx" => extract_docx_text(input)?,
+        "rtf" => {
+            let raw = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
+            strip_rtf(&raw)
+        }
+        "html" => {
+            let raw = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
+            strip_html(&raw)
+        }
+        _ => fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?,
+    };
+
+    // Step 2: Convert plain text to target format
+    let result = match out_ext.as_str() {
+        "txt" => plain_text,
+        "md" => plain_text,
+        "html" => {
+            let escaped = plain_text
                 .replace('&', "&amp;")
                 .replace('<', "&lt;")
                 .replace('>', "&gt;");
             format!(
                 "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<pre>{}</pre>\n</body>\n</html>",
-                Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document"),
-                escaped
+                title, escaped
             )
         }
-        ("html", "txt") | ("html", "md") => {
-            // Strip HTML tags (basic)
-            let re_tags = content
-                .replace("<br>", "\n")
-                .replace("<br/>", "\n")
-                .replace("<br />", "\n")
-                .replace("<p>", "\n")
-                .replace("</p>", "\n");
-            let mut result = String::new();
-            let mut in_tag = false;
-            for ch in re_tags.chars() {
-                if ch == '<' { in_tag = true; continue; }
-                if ch == '>' { in_tag = false; continue; }
-                if !in_tag { result.push(ch); }
+        "rtf" => {
+            // Build minimal RTF document
+            let mut rtf = String::from("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Calibri;}}\n");
+            for line in plain_text.lines() {
+                // Escape RTF special chars
+                let escaped: String = line.chars().map(|c| match c {
+                    '\\' => "\\\\".to_string(),
+                    '{' => "\\{".to_string(),
+                    '}' => "\\}".to_string(),
+                    c if (c as u32) > 127 => format!("\\u{}?", c as i16),
+                    c => c.to_string(),
+                }).collect();
+                rtf.push_str(&escaped);
+                rtf.push_str("\\par\n");
             }
-            result
+            rtf.push('}');
+            rtf
         }
-        ("txt", "md") => content,
-        ("md", "txt") => content,
-        ("rtf", "txt") => content,
-        ("docx", "txt") => extract_docx_text(input)?,
-        ("docx", "html") => {
-            let text = extract_docx_text(input)?;
-            let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-            format!(
-                "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<pre>{}</pre>\n</body>\n</html>",
-                Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document"),
-                escaped
-            )
+        "docx" => {
+            // Build minimal DOCX (ZIP with word/document.xml)
+            return create_docx_from_text(&plain_text, output);
         }
-        ("docx", "md") => extract_docx_text(input)?,
-        _ => content,
+        _ => plain_text,
     };
 
     fs::write(output, &result).map_err(|e| format!("Write error: {}", e))?;
+    Ok(output.to_string())
+}
+
+/// Strip RTF control words, extract plain text
+fn strip_rtf(rtf: &str) -> String {
+    let mut result = String::new();
+    let mut chars = rtf.chars().peekable();
+    let mut brace_depth = 0;
+    let mut skip_group = 0;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                brace_depth += 1;
+            }
+            '}' => {
+                if skip_group > 0 && brace_depth <= skip_group {
+                    skip_group = 0;
+                }
+                brace_depth -= 1;
+            }
+            '\\' if skip_group == 0 => {
+                // Read control word
+                let mut word = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphabetic() {
+                        word.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Skip optional numeric parameter
+                let mut _num = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() || c == '-' {
+                        _num.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Consume trailing space
+                if let Some(&' ') = chars.peek() { chars.next(); }
+
+                match word.as_str() {
+                    "par" | "line" => result.push('\n'),
+                    "tab" => result.push('\t'),
+                    // Skip header groups
+                    "fonttbl" | "colortbl" | "stylesheet" | "info" | "pict" => {
+                        skip_group = brace_depth;
+                    }
+                    _ => {}
+                }
+                if word.is_empty() {
+                    // Escaped char like \\ \{ \}
+                    if let Some(c) = chars.next() {
+                        if skip_group == 0 { result.push(c); }
+                    }
+                }
+            }
+            _ if skip_group > 0 => {} // skip
+            '\r' | '\n' => {} // ignore raw newlines in RTF
+            _ => result.push(ch),
+        }
+    }
+    result.trim().to_string()
+}
+
+/// Strip HTML tags, extract plain text
+fn strip_html(html: &str) -> String {
+    let prepared = html
+        .replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+        .replace("<p>", "\n").replace("</p>", "\n")
+        .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&nbsp;", " ").replace("&quot;", "\"");
+    let mut result = String::new();
+    let mut in_tag = false;
+    for ch in prepared.chars() {
+        if ch == '<' { in_tag = true; continue; }
+        if ch == '>' { in_tag = false; continue; }
+        if !in_tag { result.push(ch); }
+    }
+    result.trim().to_string()
+}
+
+/// Create a minimal .docx file from plain text
+fn create_docx_from_text(text: &str, output: &str) -> Result<String, String> {
+    let file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    // [Content_Types].xml
+    zip.start_file("[Content_Types].xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // _rels/.rels
+    zip.start_file("_rels/.rels", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // word/_rels/document.xml.rels
+    zip.start_file("word/_rels/document.xml.rels", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // word/document.xml
+    let mut doc_xml = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+"#);
+    for line in text.lines() {
+        let escaped = line.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        doc_xml.push_str(&format!("    <w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>\n", escaped));
+    }
+    doc_xml.push_str("  </w:body>\n</w:document>");
+
+    zip.start_file("word/document.xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, doc_xml.as_bytes()).map_err(|e| format!("Write: {}", e))?;
+
+    zip.finish().map_err(|e| format!("ZIP finish: {}", e))?;
     Ok(output.to_string())
 }
 
