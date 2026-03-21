@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OmniConvert",
+  "productName": "OmniConvert - 3WVKV",
   "version": "0.1.0",
   "identifier": "com.wvkv.omniconvert",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "OmniConvert",
+        "title": "OmniConvert - 3WVKV",
         "width": 1200,
         "height": 800,
         "minWidth": 900,

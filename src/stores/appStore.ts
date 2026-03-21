@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { FileEntry, ConversionJob, ConversionOptions } from "@/types/conversion";
 import type { PdfDocument, SavedSignature } from "@/types/pdf";
 
-export type AppView = "converter" | "pdfMerge" | "pdfSignature" | "pdfToolkit" | "ocr";
+export type AppView = "converter" | "pdfMerge" | "pdfSignature" | "pdfToolkit" | "ocr" | "videoTools";
 
 interface AppState {
   currentView: AppView;

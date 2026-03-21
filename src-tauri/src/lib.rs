@@ -42,6 +42,15 @@ struct OcrResult {
     confidence: f64,
 }
 
+#[derive(Serialize)]
+struct MediaInfo {
+    duration: String,
+    video_codec: String,
+    audio_codec: String,
+    resolution: String,
+    file_size: u64,
+}
+
 // ─── Helper: find ffmpeg ───────────────────────────────────────────
 
 fn find_ffmpeg() -> String {
@@ -98,16 +107,56 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
         _ => return Err(format!("Unsupported output image format: {}", out_ext)),
     };
 
-    if matches!(format, ImageFormat::Jpeg) {
-        let mut buf = std::io::BufWriter::new(
-            fs::File::create(output).map_err(|e| format!("Cannot create output: {}", e))?,
-        );
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality as u8);
-        img.write_with_encoder(encoder)
-            .map_err(|e| format!("JPEG encode error: {}", e))?;
-    } else {
-        img.save_with_format(output, format)
-            .map_err(|e| format!("Failed to save image: {}", e))?;
+    match format {
+        ImageFormat::Jpeg => {
+            let mut buf = std::io::BufWriter::new(
+                fs::File::create(output).map_err(|e| format!("Cannot create output: {}", e))?,
+            );
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality as u8);
+            img.write_with_encoder(encoder)
+                .map_err(|e| format!("JPEG encode error: {}", e))?;
+        }
+        ImageFormat::Png => {
+            // quality 1-100: 100=fast compression (bigger), 1=best compression (smaller)
+            let compression = if quality >= 80 {
+                image::codecs::png::CompressionType::Fast
+            } else if quality >= 40 {
+                image::codecs::png::CompressionType::Default
+            } else {
+                image::codecs::png::CompressionType::Best
+            };
+            let filter = image::codecs::png::FilterType::Adaptive;
+            let mut buf = std::io::BufWriter::new(
+                fs::File::create(output).map_err(|e| format!("Cannot create output: {}", e))?,
+            );
+            let encoder = image::codecs::png::PngEncoder::new_with_quality(&mut buf, compression, filter);
+            img.write_with_encoder(encoder)
+                .map_err(|e| format!("PNG encode error: {}", e))?;
+        }
+        ImageFormat::WebP => {
+            // Use ffmpeg for lossy WebP with quality control
+            if quality < 95 {
+                let ffmpeg = find_ffmpeg();
+                let q = quality.to_string();
+                let cmd_output = Command::new(&ffmpeg)
+                    .args(["-y", "-i", input, "-quality", &q, output])
+                    .output();
+                match cmd_output {
+                    Ok(o) if o.status.success() => {}
+                    _ => {
+                        img.save_with_format(output, format)
+                            .map_err(|e| format!("Failed to save image: {}", e))?;
+                    }
+                }
+            } else {
+                img.save_with_format(output, format)
+                    .map_err(|e| format!("Failed to save image: {}", e))?;
+            }
+        }
+        _ => {
+            img.save_with_format(output, format)
+                .map_err(|e| format!("Failed to save image: {}", e))?;
+        }
     }
 
     Ok(output.to_string())
@@ -1137,6 +1186,229 @@ fn write_text_file(path: String, content: String) -> Result<String, String> {
     Ok(path)
 }
 
+// ─── FFmpeg video editing commands ────────────────────────────────
+
+#[tauri::command]
+fn ffmpeg_trim(input_path: String, output_path: String, start_time: String, end_time: String) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    let output = Command::new(&ffmpeg)
+        .args(["-y", "-i", &input_path, "-ss", &start_time, "-to", &end_time, "-c", "copy", &output_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg trim failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_merge_videos(input_paths: Vec<String>, output_path: String) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    // Create a temp file with the list of inputs
+    let temp_dir = std::env::temp_dir();
+    let list_path = temp_dir.join("ffmpeg_merge_list.txt");
+    let list_content: String = input_paths.iter()
+        .map(|p| format!("file '{}'", p.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&list_path, &list_content).map_err(|e| format!("Write list error: {}", e))?;
+
+    let output = Command::new(&ffmpeg)
+        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list_path)
+        .args(["-c", "copy", &output_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    let _ = fs::remove_file(&list_path);
+    if !output.status.success() {
+        return Err(format!("ffmpeg merge failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_extract_audio(input_path: String, output_path: String) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    let output = Command::new(&ffmpeg)
+        .args(["-y", "-i", &input_path, "-vn", "-acodec", "copy", &output_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    if !output.status.success() {
+        // If copy codec fails, try re-encoding
+        let output2 = Command::new(&ffmpeg)
+            .args(["-y", "-i", &input_path, "-vn", "-q:a", "2", &output_path])
+            .output()
+            .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+        if !output2.status.success() {
+            return Err(format!("ffmpeg extract audio failed: {}", String::from_utf8_lossy(&output2.stderr)));
+        }
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_resize(input_path: String, output_path: String, width: u32, height: u32) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    let scale = format!("scale={}:{}", width, height);
+    let output = Command::new(&ffmpeg)
+        .args(["-y", "-i", &input_path, "-vf", &scale, "-c:a", "copy", &output_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg resize failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_compress(input_path: String, output_path: String, crf: u32) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    let output = Command::new(&ffmpeg)
+        .args(["-y", "-i", &input_path, "-c:v", "libx264", "-crf", &crf.to_string(), "-preset", "medium", "-c:a", "aac", "-b:a", "128k", &output_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg compress failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_to_gif(input_path: String, output_path: String, fps: u32, width: u32) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    // Two-pass GIF with palette generation for high quality (no pixel artifacts)
+    let palette_path = format!("{}.palette.png", &output_path);
+    let filter = format!("fps={},scale={}:-1:flags=lanczos", fps, width);
+
+    // Pass 1: generate optimal palette
+    let pass1 = Command::new(&ffmpeg)
+        .args(["-y", "-i", &input_path, "-vf", &format!("{},palettegen=stats_mode=diff", filter), &palette_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    if !pass1.status.success() {
+        return Err(format!("ffmpeg gif palette failed: {}", String::from_utf8_lossy(&pass1.stderr)));
+    }
+
+    // Pass 2: use palette for high quality GIF
+    let pass2 = Command::new(&ffmpeg)
+        .args([
+            "-y", "-i", &input_path, "-i", &palette_path,
+            "-lavfi", &format!("{} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5", filter),
+            "-loop", "0", &output_path,
+        ])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+
+    // Cleanup palette temp file
+    let _ = fs::remove_file(&palette_path);
+
+    if !pass2.status.success() {
+        return Err(format!("ffmpeg gif failed: {}", String::from_utf8_lossy(&pass2.stderr)));
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_rotate(input_path: String, output_path: String, rotation: String) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    // rotation: "90" = clockwise, "270" = counter-clockwise, "180" = flip
+    let transpose = match rotation.as_str() {
+        "90" => "transpose=1",
+        "270" => "transpose=2",
+        "180" => "transpose=1,transpose=1",
+        _ => return Err(format!("Invalid rotation: {}. Use 90, 180, or 270", rotation)),
+    };
+    let output = Command::new(&ffmpeg)
+        .args(["-y", "-i", &input_path, "-vf", transpose, "-c:a", "copy", &output_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg rotate failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_remove_audio(input_path: String, output_path: String) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    let output = Command::new(&ffmpeg)
+        .args(["-y", "-i", &input_path, "-an", "-c:v", "copy", &output_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg remove audio failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_thumbnail(input_path: String, output_path: String, time: String) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    let output = Command::new(&ffmpeg)
+        .args(["-y", "-i", &input_path, "-ss", &time, "-vframes", "1", "-q:v", "2", &output_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg thumbnail failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output_path)
+}
+
+#[tauri::command]
+fn get_media_info(path: String) -> Result<MediaInfo, String> {
+    let ffmpeg = find_ffmpeg();
+    // Use ffprobe if available, otherwise parse ffmpeg stderr
+    let ffprobe = ffmpeg.replace("ffmpeg", "ffprobe");
+    let output = Command::new(&ffprobe)
+        .args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", &path])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let json_str = String::from_utf8_lossy(&out.stdout);
+            let json: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+
+            let duration = json["format"]["duration"].as_str().unwrap_or("0").to_string();
+            let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+            let streams = json["streams"].as_array();
+            let mut video_codec = String::new();
+            let mut audio_codec = String::new();
+            let mut resolution = String::new();
+
+            if let Some(streams) = streams {
+                for stream in streams {
+                    let codec_type = stream["codec_type"].as_str().unwrap_or("");
+                    if codec_type == "video" {
+                        video_codec = stream["codec_name"].as_str().unwrap_or("").to_string();
+                        let w = stream["width"].as_u64().unwrap_or(0);
+                        let h = stream["height"].as_u64().unwrap_or(0);
+                        if w > 0 && h > 0 {
+                            resolution = format!("{}x{}", w, h);
+                        }
+                    } else if codec_type == "audio" {
+                        audio_codec = stream["codec_name"].as_str().unwrap_or("").to_string();
+                    }
+                }
+            }
+
+            Ok(MediaInfo { duration, video_codec, audio_codec, resolution, file_size })
+        }
+        _ => {
+            let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            Ok(MediaInfo {
+                duration: "unknown".to_string(),
+                video_codec: "unknown".to_string(),
+                audio_codec: "unknown".to_string(),
+                resolution: "unknown".to_string(),
+                file_size,
+            })
+        }
+    }
+}
+
+// ─── OCR commands ─────────────────────────────────────────────────
+
 #[tauri::command]
 fn ocr_extract(path: String, language: String) -> Result<OcrResult, String> {
     let tesseract = find_tesseract();
@@ -1162,13 +1434,62 @@ fn ocr_extract(path: String, language: String) -> Result<OcrResult, String> {
         .map_err(|e| format!("Tesseract error: {}. Make sure Tesseract OCR is installed.", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if stderr.contains("Failed loading language") {
+            return Err(format!("TESSERACT_LANG_NOT_AVAILABLE:{}", language));
+        }
         return Err(format!("Tesseract failed: {}", stderr));
     }
 
     let text = String::from_utf8_lossy(&output.stdout).to_string();
     let word_count = text.split_whitespace().count();
 
+    Ok(OcrResult {
+        text,
+        confidence: if word_count > 0 { 0.85 } else { 0.0 },
+    })
+}
+
+#[tauri::command]
+fn ocr_extract_base64(image_base64: String, language: String) -> Result<OcrResult, String> {
+    let tesseract = find_tesseract();
+    let check = Command::new(&tesseract).arg("--version").output();
+    if check.is_err() {
+        return Err("TESSERACT_NOT_INSTALLED".to_string());
+    }
+
+    // Decode base64 image and save to temp file
+    let img_data = if image_base64.contains(',') {
+        let parts: Vec<&str> = image_base64.splitn(2, ',').collect();
+        STANDARD.decode(parts.get(1).unwrap_or(&"")).map_err(|e| format!("Base64 decode: {}", e))?
+    } else {
+        STANDARD.decode(&image_base64).map_err(|e| format!("Base64 decode: {}", e))?
+    };
+
+    let temp_dir = std::env::temp_dir();
+    let temp_path = temp_dir.join("ocr_temp_image.png");
+    fs::write(&temp_path, &img_data).map_err(|e| format!("Write temp: {}", e))?;
+
+    let output = Command::new(&tesseract)
+        .arg(temp_path.to_string_lossy().as_ref())
+        .arg("stdout")
+        .arg("-l")
+        .arg(&language)
+        .output()
+        .map_err(|e| format!("Tesseract error: {}", e))?;
+
+    let _ = fs::remove_file(&temp_path);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if stderr.contains("Failed loading language") {
+            return Err(format!("TESSERACT_LANG_NOT_AVAILABLE:{}", language));
+        }
+        return Err(format!("Tesseract failed: {}", stderr));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let word_count = text.split_whitespace().count();
     Ok(OcrResult {
         text,
         confidence: if word_count > 0 { 0.85 } else { 0.0 },
@@ -1224,6 +1545,17 @@ pub fn run() {
             read_file_base64,
             write_text_file,
             ocr_extract,
+            ocr_extract_base64,
+            ffmpeg_trim,
+            ffmpeg_merge_videos,
+            ffmpeg_extract_audio,
+            ffmpeg_resize,
+            ffmpeg_compress,
+            ffmpeg_to_gif,
+            ffmpeg_rotate,
+            ffmpeg_remove_audio,
+            ffmpeg_thumbnail,
+            get_media_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

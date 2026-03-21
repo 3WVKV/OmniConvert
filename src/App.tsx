@@ -5,6 +5,7 @@ import { PdfMergePage } from "@/pages/PdfMergePage";
 import { PdfSignaturePage } from "@/pages/PdfSignaturePage";
 import { PdfToolkitPage } from "@/pages/PdfToolkitPage";
 import { OcrPage } from "@/pages/OcrPage";
+import { VideoToolsPage } from "@/pages/VideoToolsPage";
 import { Toaster } from "@/components/ui/sonner";
 
 const PAGES = {
@@ -13,6 +14,7 @@ const PAGES = {
   pdfSignature: PdfSignaturePage,
   pdfToolkit: PdfToolkitPage,
   ocr: OcrPage,
+  videoTools: VideoToolsPage,
 } as const;
 
 function App() {

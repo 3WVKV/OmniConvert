@@ -6,6 +6,7 @@ import {
   PenTool,
   Wrench,
   ScanText,
+  Film,
   Sun,
   Moon,
   Languages,
@@ -21,14 +22,19 @@ const NAV_ITEMS: { key: AppView; icon: typeof ArrowLeftRight; translationKey: st
   { key: "pdfSignature", icon: PenTool, translationKey: "nav.pdfSignature" },
   { key: "pdfToolkit", icon: Wrench, translationKey: "nav.pdfToolkit" },
   { key: "ocr", icon: ScanText, translationKey: "nav.ocr" },
+  { key: "videoTools", icon: Film, translationKey: "nav.videoTools" },
 ];
 
 export function Sidebar() {
   const { t, i18n } = useTranslation();
   const { currentView, setView } = useAppStore();
-  const [dark, setDark] = useState(() =>
-    document.documentElement.classList.contains("dark")
-  );
+  const [dark, setDark] = useState(() => {
+    const saved = localStorage.getItem("theme");
+    if (saved === "dark") return true;
+    if (saved === "light") return false;
+    // System preference, default to dark if no preference
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? false : true;
+  });
 
   useEffect(() => {
     if (dark) {
@@ -39,11 +45,15 @@ export function Sidebar() {
     localStorage.setItem("theme", dark ? "dark" : "light");
   }, [dark]);
 
+  // Listen for system theme changes
   useEffect(() => {
-    const saved = localStorage.getItem("theme");
-    if (saved === "dark") setDark(true);
-    else if (saved === "light") setDark(false);
-    else if (window.matchMedia("(prefers-color-scheme: dark)").matches) setDark(true);
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e: MediaQueryListEvent) => {
+      const saved = localStorage.getItem("theme");
+      if (!saved) setDark(e.matches);
+    };
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
   }, []);
 
   const toggleLang = () => {
