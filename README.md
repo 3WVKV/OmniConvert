@@ -7,14 +7,15 @@ Application desktop de manipulation de fichiers 100% locale. Convertissez, fusio
 ### Convertisseur universel
 Glissez-deposez vos fichiers et convertissez-les dans le format de votre choix. Mode fichier unique ou batch.
 
-| Categorie | Formats supportes |
-|-----------|-------------------|
-| Images | JPG, PNG, WebP, GIF, BMP, TIFF, AVIF, HEIC, ICO, SVG |
-| Documents | TXT, MD, HTML, RTF, DOCX, DOC → TXT, HTML, MD, PDF |
-| Donnees | CSV, JSON, XML, YAML, XLS, XLSX, ODS |
-| Audio | MP3, WAV, FLAC, AAC, OGG, M4A, OPUS |
-| Video | MP4, MOV, MKV, AVI, WebM, FLV, MPEG |
-| Archives | ZIP, RAR, 7Z, TAR, GZ |
+| Categorie | Formats supportes | Conversions |
+|-----------|-------------------|-------------|
+| Images | JPG, PNG, WebP, GIF, BMP, TIFF, AVIF, HEIC, ICO, SVG | Entre tous les formats + vers PDF |
+| Documents | TXT, MD, HTML, RTF, DOCX, DOC | Entre tous les formats + vers PDF |
+| Donnees | CSV, JSON, XML, YAML, XLS, XLSX, ODS | Entre tous les formats (XLSX lu en binaire) |
+| Audio | MP3, WAV, FLAC, AAC, OGG, M4A, OPUS | Entre tous les formats (via FFmpeg) |
+| Video | MP4, MOV, MKV, AVI, WebM, FLV, MPEG | Entre tous les formats (via FFmpeg) |
+| Archives | ZIP, TAR, GZ, 7Z, RAR | ZIP ↔ TAR ↔ GZ ↔ 7Z (RAR en lecture seule) |
+| PDF | PDF | Vers TXT, MD, HTML, RTF, DOCX, JPG, PNG, WebP, BMP, TIFF |
 
 ### Fusion PDF
 Importez plusieurs PDF, previsualisation par miniature, reorganisez l'ordre, fusionnez en un seul fichier.
@@ -26,7 +27,7 @@ Chargez un PDF, ajoutez une signature (dessin, texte ou image importee), placez-
 - **Diviser** un PDF en plusieurs fichiers
 - **Extraire** des pages specifiques
 - **Pivoter** les pages (90, 180, 270 degres)
-- **Compresser** un PDF
+- **Compresser** un PDF (3 niveaux : low/medium/high, recompression JPEG intelligente)
 - **Convertir** un PDF en images ou en texte
 
 ### Outils Video (FFmpeg)
@@ -35,7 +36,7 @@ Chargez un PDF, ajoutez une signature (dessin, texte ou image importee), placez-
 - **Extraire l'audio** d'une video
 - **Redimensionner** une video
 - **Compresser** une video (controle CRF)
-- **Convertir en GIF** (palette optimisee, sans artefacts)
+- **Convertir en GIF** (FPS et largeur configurables)
 - **Pivoter** une video
 - **Supprimer l'audio** d'une video
 - **Extraire une miniature** (frame unique)
@@ -216,6 +217,7 @@ Les fichiers de sortie se trouvent dans `src-tauri/target/release/bundle/` :
 | i18n | i18next (FR / EN) |
 | PDF | lopdf (Rust) + pdf.js (preview) |
 | Images | image crate (Rust) |
+| Archives | zip + tar + flate2 + sevenz-rust (Rust) |
 | Audio/Video | FFmpeg (CLI externe) |
 | OCR | Tesseract (CLI externe) |
 
