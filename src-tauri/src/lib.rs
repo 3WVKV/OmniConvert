@@ -95,20 +95,8 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
         .unwrap_or("")
         .to_lowercase();
 
-    let format = match out_ext.as_str() {
-        "jpg" | "jpeg" => ImageFormat::Jpeg,
-        "png" => ImageFormat::Png,
-        "gif" => ImageFormat::Gif,
-        "bmp" => ImageFormat::Bmp,
-        "tiff" | "tif" => ImageFormat::Tiff,
-        "webp" => ImageFormat::WebP,
-        "avif" => ImageFormat::Avif,
-        "ico" => ImageFormat::Ico,
-        _ => return Err(format!("Unsupported output image format: {}", out_ext)),
-    };
-
-    match format {
-        ImageFormat::Jpeg => {
+    match out_ext.as_str() {
+        "jpg" | "jpeg" => {
             let mut buf = std::io::BufWriter::new(
                 fs::File::create(output).map_err(|e| format!("Cannot create output: {}", e))?,
             );
@@ -116,8 +104,7 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
             img.write_with_encoder(encoder)
                 .map_err(|e| format!("JPEG encode error: {}", e))?;
         }
-        ImageFormat::Png => {
-            // quality 1-100: 100=fast compression (bigger), 1=best compression (smaller)
+        "png" => {
             let compression = if quality >= 80 {
                 image::codecs::png::CompressionType::Fast
             } else if quality >= 40 {
@@ -133,8 +120,7 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
             img.write_with_encoder(encoder)
                 .map_err(|e| format!("PNG encode error: {}", e))?;
         }
-        ImageFormat::WebP => {
-            // Use ffmpeg for lossy WebP with quality control
+        "webp" => {
             if quality < 95 {
                 let ffmpeg = find_ffmpeg();
                 let q = quality.to_string();
@@ -144,19 +130,75 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
                 match cmd_output {
                     Ok(o) if o.status.success() => {}
                     _ => {
-                        img.save_with_format(output, format)
+                        img.save_with_format(output, ImageFormat::WebP)
                             .map_err(|e| format!("Failed to save image: {}", e))?;
                     }
                 }
             } else {
-                img.save_with_format(output, format)
+                img.save_with_format(output, ImageFormat::WebP)
                     .map_err(|e| format!("Failed to save image: {}", e))?;
             }
         }
-        _ => {
+        "ico" => {
+            // ICO requires dimensions 1..=256
+            let resized = if img.width() > 256 || img.height() > 256 {
+                img.resize(256, 256, image::imageops::FilterType::Lanczos3)
+            } else {
+                img.clone()
+            };
+            resized.save_with_format(output, ImageFormat::Ico)
+                .map_err(|e| format!("Failed to save ICO: {}", e))?;
+        }
+        "svg" => {
+            // Raster → SVG: embed image as base64 data URI
+            let mut png_buf: Vec<u8> = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut png_buf);
+            img.write_to(&mut cursor, ImageFormat::Png)
+                .map_err(|e| format!("PNG encode: {}", e))?;
+            let b64 = STANDARD.encode(&png_buf);
+            let svg = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="{}" height="{}" viewBox="0 0 {} {}">
+  <image width="{}" height="{}" href="data:image/png;base64,{}"/>
+</svg>"#,
+                img.width(), img.height(), img.width(), img.height(),
+                img.width(), img.height(), b64
+            );
+            fs::write(output, svg).map_err(|e| format!("Write SVG: {}", e))?;
+        }
+        "heic" => {
+            // HEIC encoding not natively supported — use ImageMagick/ffmpeg
+            let magick = if cfg!(windows) { "magick" } else { "convert" };
+            let result = Command::new(magick)
+                .arg(input).arg(output)
+                .output();
+            match result {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    let ffmpeg = find_ffmpeg();
+                    let result2 = Command::new(&ffmpeg)
+                        .args(["-y", "-i", input, output])
+                        .output();
+                    match result2 {
+                        Ok(o) if o.status.success() => {}
+                        _ => return Err("HEIC encoding requires ImageMagick or ffmpeg with libheif support".to_string()),
+                    }
+                }
+            }
+        }
+        "gif" | "bmp" | "tiff" | "tif" | "avif" => {
+            let format = match out_ext.as_str() {
+                "gif" => ImageFormat::Gif,
+                "bmp" => ImageFormat::Bmp,
+                "tiff" | "tif" => ImageFormat::Tiff,
+                "avif" => ImageFormat::Avif,
+                _ => unreachable!(),
+            };
             img.save_with_format(output, format)
                 .map_err(|e| format!("Failed to save image: {}", e))?;
         }
+        _ => return Err(format!("Unsupported output image format: {}", out_ext)),
     }
 
     Ok(output.to_string())
@@ -176,35 +218,147 @@ fn convert_data(input: &str, output: &str) -> Result<String, String> {
         .unwrap_or("")
         .to_lowercase();
 
-    let content = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
-
     // Parse to intermediate JSON value
     let data: serde_json::Value = match in_ext.as_str() {
-        "json" => serde_json::from_str(&content).map_err(|e| format!("JSON parse: {}", e))?,
-        "csv" => {
-            let mut reader = csv::ReaderBuilder::new()
-                .from_reader(content.as_bytes());
-            let headers: Vec<String> = reader
-                .headers()
-                .map_err(|e| format!("CSV headers: {}", e))?
-                .iter()
-                .map(|h| h.to_string())
-                .collect();
-            let mut rows = Vec::new();
-            for result in reader.records() {
-                let record = result.map_err(|e| format!("CSV record: {}", e))?;
-                let mut obj = serde_json::Map::new();
-                for (i, field) in record.iter().enumerate() {
-                    let key = headers.get(i).cloned().unwrap_or_else(|| format!("col{}", i));
-                    obj.insert(key, serde_json::Value::String(field.to_string()));
+        "xlsx" | "xls" | "ods" => {
+            // Binary spreadsheet: extract cell data from shared strings + sheet XML
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+
+            // Read shared strings
+            let mut shared_strings: Vec<String> = Vec::new();
+            if let Ok(mut ss_file) = archive.by_name("xl/sharedStrings.xml") {
+                let mut ss_content = String::new();
+                std::io::Read::read_to_string(&mut ss_file, &mut ss_content)
+                    .map_err(|e| format!("Read shared strings: {}", e))?;
+                // Extract <t>...</t> values
+                let mut in_t = false;
+                let mut current = String::new();
+                let mut chars = ss_content.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch == '<' {
+                        let mut tag = String::new();
+                        for tc in chars.by_ref() {
+                            if tc == '>' { break; }
+                            tag.push(tc);
+                        }
+                        if tag == "t" || tag.starts_with("t ") {
+                            in_t = true;
+                            current.clear();
+                        } else if tag == "/t" {
+                            in_t = false;
+                            shared_strings.push(current.clone());
+                        }
+                    } else if in_t {
+                        current.push(ch);
+                    }
                 }
-                rows.push(serde_json::Value::Object(obj));
             }
-            serde_json::Value::Array(rows)
+
+            // Read sheet1
+            let sheet_names = ["xl/worksheets/sheet1.xml", "xl/worksheets/sheet.xml"];
+            let mut sheet_content = String::new();
+            for name in &sheet_names {
+                if let Ok(mut sheet_file) = archive.by_name(name) {
+                    std::io::Read::read_to_string(&mut sheet_file, &mut sheet_content)
+                        .map_err(|e| format!("Read sheet: {}", e))?;
+                    break;
+                }
+            }
+            if sheet_content.is_empty() {
+                return Err("Could not find worksheet in spreadsheet".to_string());
+            }
+
+            // Parse rows: extract <row>...<c r="A1" t="s"><v>0</v></c>...</row>
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for row_match in sheet_content.split("<row ") {
+                if !row_match.contains("<c ") { continue; }
+                let mut cells: Vec<(usize, String)> = Vec::new();
+                for cell_part in row_match.split("<c ") {
+                    if !cell_part.contains("<v>") { continue; }
+                    // Get column letter to determine position
+                    let col_idx = if let Some(r_start) = cell_part.find("r=\"") {
+                        let r_val = &cell_part[r_start + 3..];
+                        if let Some(end) = r_val.find('"') {
+                            let cell_ref = &r_val[..end];
+                            let col_letters: String = cell_ref.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+                            col_letters.chars().fold(0usize, |acc, c| acc * 26 + (c as usize - 'A' as usize + 1)) - 1
+                        } else { 0 }
+                    } else { 0 };
+
+                    let is_shared = cell_part.contains("t=\"s\"");
+                    if let Some(v_start) = cell_part.find("<v>") {
+                        if let Some(v_end) = cell_part.find("</v>") {
+                            let val = &cell_part[v_start + 3..v_end];
+                            let cell_value = if is_shared {
+                                if let Ok(idx) = val.parse::<usize>() {
+                                    shared_strings.get(idx).cloned().unwrap_or_default()
+                                } else { val.to_string() }
+                            } else {
+                                val.to_string()
+                            };
+                            cells.push((col_idx, cell_value));
+                        }
+                    }
+                }
+                if !cells.is_empty() {
+                    let max_col = cells.iter().map(|(c, _)| *c).max().unwrap_or(0);
+                    let mut row = vec![String::new(); max_col + 1];
+                    for (col, val) in cells {
+                        row[col] = val;
+                    }
+                    rows.push(row);
+                }
+            }
+
+            // First row = headers, rest = data
+            if rows.is_empty() {
+                serde_json::Value::Array(Vec::new())
+            } else {
+                let headers = rows.remove(0);
+                let json_rows: Vec<serde_json::Value> = rows.iter().map(|row| {
+                    let mut obj = serde_json::Map::new();
+                    for (i, val) in row.iter().enumerate() {
+                        let key = headers.get(i).filter(|h| !h.is_empty())
+                            .cloned().unwrap_or_else(|| format!("col{}", i));
+                        obj.insert(key, serde_json::Value::String(val.clone()));
+                    }
+                    serde_json::Value::Object(obj)
+                }).collect();
+                serde_json::Value::Array(json_rows)
+            }
         }
-        "xml" => serde_json::Value::String(content),
-        "yaml" | "yml" => serde_json::Value::String(content),
-        _ => return Err(format!("Unsupported input data format: {}", in_ext)),
+        _ => {
+            // Text-based formats
+            let content = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
+            match in_ext.as_str() {
+                "json" => serde_json::from_str(&content).map_err(|e| format!("JSON parse: {}", e))?,
+                "csv" => {
+                    let mut reader = csv::ReaderBuilder::new()
+                        .from_reader(content.as_bytes());
+                    let headers: Vec<String> = reader
+                        .headers()
+                        .map_err(|e| format!("CSV headers: {}", e))?
+                        .iter()
+                        .map(|h| h.to_string())
+                        .collect();
+                    let mut rows = Vec::new();
+                    for result in reader.records() {
+                        let record = result.map_err(|e| format!("CSV record: {}", e))?;
+                        let mut obj = serde_json::Map::new();
+                        for (i, field) in record.iter().enumerate() {
+                            let key = headers.get(i).cloned().unwrap_or_else(|| format!("col{}", i));
+                            obj.insert(key, serde_json::Value::String(field.to_string()));
+                        }
+                        rows.push(serde_json::Value::Object(obj));
+                    }
+                    serde_json::Value::Array(rows)
+                }
+                "xml" => serde_json::Value::String(content),
+                "yaml" | "yml" => serde_json::Value::String(content),
+                _ => return Err(format!("Unsupported input data format: {}", in_ext)),
+            }
+        }
     };
 
     let output_content = match out_ext.as_str() {
@@ -246,6 +400,10 @@ fn convert_data(input: &str, output: &str) -> Result<String, String> {
             serde_json::Value::String(s) => s.clone(),
             _ => serde_json::to_string_pretty(&data).unwrap_or_default(),
         },
+        "xlsx" | "xls" | "ods" => {
+            // Write data as XLSX (minimal spreadsheet via ZIP + XML)
+            return create_xlsx_from_json(&data, output);
+        }
         _ => return Err(format!("Unsupported output data format: {}", out_ext)),
     };
 
@@ -253,61 +411,280 @@ fn convert_data(input: &str, output: &str) -> Result<String, String> {
     Ok(output.to_string())
 }
 
+/// Create a minimal .xlsx file from JSON data
+fn create_xlsx_from_json(data: &serde_json::Value, output: &str) -> Result<String, String> {
+    let file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    // [Content_Types].xml
+    zip.start_file("[Content_Types].xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // _rels/.rels
+    zip.start_file("_rels/.rels", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // xl/_rels/workbook.xml.rels
+    zip.start_file("xl/_rels/workbook.xml.rels", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // xl/workbook.xml
+    zip.start_file("xl/workbook.xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // xl/worksheets/sheet1.xml — build rows from JSON array
+    let mut sheet = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+"#);
+
+    if let serde_json::Value::Array(arr) = data {
+        // Extract headers from first object
+        if let Some(serde_json::Value::Object(first)) = arr.first() {
+            let headers: Vec<&String> = first.keys().collect();
+            // Header row
+            sheet.push_str("    <row r=\"1\">");
+            for (i, h) in headers.iter().enumerate() {
+                let col = (b'A' + i as u8) as char;
+                let escaped = h.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                sheet.push_str(&format!("<c r=\"{}1\" t=\"inlineStr\"><is><t>{}</t></is></c>", col, escaped));
+            }
+            sheet.push_str("</row>\n");
+            // Data rows
+            for (row_idx, item) in arr.iter().enumerate() {
+                if let serde_json::Value::Object(obj) = item {
+                    let row_num = row_idx + 2;
+                    sheet.push_str(&format!("    <row r=\"{}\">", row_num));
+                    for (i, h) in headers.iter().enumerate() {
+                        let col = (b'A' + i as u8) as char;
+                        let val = obj.get(*h).map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        }).unwrap_or_default();
+                        let escaped = val.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                        sheet.push_str(&format!("<c r=\"{}{}\" t=\"inlineStr\"><is><t>{}</t></is></c>", col, row_num, escaped));
+                    }
+                    sheet.push_str("</row>\n");
+                }
+            }
+        }
+    }
+
+    sheet.push_str("  </sheetData>\n</worksheet>");
+
+    zip.start_file("xl/worksheets/sheet1.xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, sheet.as_bytes()).map_err(|e| format!("Write: {}", e))?;
+
+    zip.finish().map_err(|e| format!("ZIP finish: {}", e))?;
+    Ok(output.to_string())
+}
+
 // ─── Text/document conversion ──────────────────────────────────────
 
 fn convert_text(input: &str, output: &str) -> Result<String, String> {
-    let content = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
     let in_ext = Path::new(input).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     let out_ext = Path::new(output).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let title = Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document");
 
-    let result = match (in_ext.as_str(), out_ext.as_str()) {
-        ("md", "html") | ("txt", "html") => {
-            // Wrap in proper HTML so the file renders correctly in a browser
-            let escaped = content
+    // Step 1: Extract plain text from any input format
+    let plain_text = match in_ext.as_str() {
+        "docx" => extract_docx_text(input)?,
+        "rtf" => {
+            let raw = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
+            strip_rtf(&raw)
+        }
+        "html" => {
+            let raw = fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?;
+            strip_html(&raw)
+        }
+        _ => fs::read_to_string(input).map_err(|e| format!("Read error: {}", e))?,
+    };
+
+    // Step 2: Convert plain text to target format
+    let result = match out_ext.as_str() {
+        "txt" => plain_text,
+        "md" => plain_text,
+        "html" => {
+            let escaped = plain_text
                 .replace('&', "&amp;")
                 .replace('<', "&lt;")
                 .replace('>', "&gt;");
             format!(
                 "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<pre>{}</pre>\n</body>\n</html>",
-                Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document"),
-                escaped
+                title, escaped
             )
         }
-        ("html", "txt") | ("html", "md") => {
-            // Strip HTML tags (basic)
-            let re_tags = content
-                .replace("<br>", "\n")
-                .replace("<br/>", "\n")
-                .replace("<br />", "\n")
-                .replace("<p>", "\n")
-                .replace("</p>", "\n");
-            let mut result = String::new();
-            let mut in_tag = false;
-            for ch in re_tags.chars() {
-                if ch == '<' { in_tag = true; continue; }
-                if ch == '>' { in_tag = false; continue; }
-                if !in_tag { result.push(ch); }
+        "rtf" => {
+            // Build minimal RTF document
+            let mut rtf = String::from("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Calibri;}}\n");
+            for line in plain_text.lines() {
+                // Escape RTF special chars
+                let escaped: String = line.chars().map(|c| match c {
+                    '\\' => "\\\\".to_string(),
+                    '{' => "\\{".to_string(),
+                    '}' => "\\}".to_string(),
+                    c if (c as u32) > 127 => format!("\\u{}?", c as i16),
+                    c => c.to_string(),
+                }).collect();
+                rtf.push_str(&escaped);
+                rtf.push_str("\\par\n");
             }
-            result
+            rtf.push('}');
+            rtf
         }
-        ("txt", "md") => content,
-        ("md", "txt") => content,
-        ("rtf", "txt") => content,
-        ("docx", "txt") => extract_docx_text(input)?,
-        ("docx", "html") => {
-            let text = extract_docx_text(input)?;
-            let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-            format!(
-                "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<pre>{}</pre>\n</body>\n</html>",
-                Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document"),
-                escaped
-            )
+        "docx" => {
+            // Build minimal DOCX (ZIP with word/document.xml)
+            return create_docx_from_text(&plain_text, output);
         }
-        ("docx", "md") => extract_docx_text(input)?,
-        _ => content,
+        _ => plain_text,
     };
 
     fs::write(output, &result).map_err(|e| format!("Write error: {}", e))?;
+    Ok(output.to_string())
+}
+
+/// Strip RTF control words, extract plain text
+fn strip_rtf(rtf: &str) -> String {
+    let mut result = String::new();
+    let mut chars = rtf.chars().peekable();
+    let mut brace_depth = 0;
+    let mut skip_group = 0;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                brace_depth += 1;
+            }
+            '}' => {
+                if skip_group > 0 && brace_depth <= skip_group {
+                    skip_group = 0;
+                }
+                brace_depth -= 1;
+            }
+            '\\' if skip_group == 0 => {
+                // Read control word
+                let mut word = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphabetic() {
+                        word.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Skip optional numeric parameter
+                let mut _num = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() || c == '-' {
+                        _num.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Consume trailing space
+                if let Some(&' ') = chars.peek() { chars.next(); }
+
+                match word.as_str() {
+                    "par" | "line" => result.push('\n'),
+                    "tab" => result.push('\t'),
+                    // Skip header groups
+                    "fonttbl" | "colortbl" | "stylesheet" | "info" | "pict" => {
+                        skip_group = brace_depth;
+                    }
+                    _ => {}
+                }
+                if word.is_empty() {
+                    // Escaped char like \\ \{ \}
+                    if let Some(c) = chars.next() {
+                        if skip_group == 0 { result.push(c); }
+                    }
+                }
+            }
+            _ if skip_group > 0 => {} // skip
+            '\r' | '\n' => {} // ignore raw newlines in RTF
+            _ => result.push(ch),
+        }
+    }
+    result.trim().to_string()
+}
+
+/// Strip HTML tags, extract plain text
+fn strip_html(html: &str) -> String {
+    let prepared = html
+        .replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+        .replace("<p>", "\n").replace("</p>", "\n")
+        .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&nbsp;", " ").replace("&quot;", "\"");
+    let mut result = String::new();
+    let mut in_tag = false;
+    for ch in prepared.chars() {
+        if ch == '<' { in_tag = true; continue; }
+        if ch == '>' { in_tag = false; continue; }
+        if !in_tag { result.push(ch); }
+    }
+    result.trim().to_string()
+}
+
+/// Create a minimal .docx file from plain text
+fn create_docx_from_text(text: &str, output: &str) -> Result<String, String> {
+    let file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    // [Content_Types].xml
+    zip.start_file("[Content_Types].xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // _rels/.rels
+    zip.start_file("_rels/.rels", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // word/_rels/document.xml.rels
+    zip.start_file("word/_rels/document.xml.rels", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>"#).map_err(|e| format!("Write: {}", e))?;
+
+    // word/document.xml
+    let mut doc_xml = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+"#);
+    for line in text.lines() {
+        let escaped = line.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        doc_xml.push_str(&format!("    <w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>\n", escaped));
+    }
+    doc_xml.push_str("  </w:body>\n</w:document>");
+
+    zip.start_file("word/document.xml", options).map_err(|e| format!("ZIP: {}", e))?;
+    std::io::Write::write_all(&mut zip, doc_xml.as_bytes()).map_err(|e| format!("Write: {}", e))?;
+
+    zip.finish().map_err(|e| format!("ZIP finish: {}", e))?;
     Ok(output.to_string())
 }
 
@@ -574,18 +951,56 @@ fn convert_to_pdf(input: &str, output: &str) -> Result<String, String> {
             // Create a simple text PDF
             let mut doc = lopdf::Document::with_version("1.5");
 
-            // Split text into lines and pages (roughly 50 lines per page at 12pt)
-            let lines: Vec<&str> = plain_text.lines().collect();
-            let lines_per_page = 50;
-            let page_w: i64 = 612; // US Letter
-            let page_h: i64 = 792;
+            let page_w: i64 = 595; // A4
+            let page_h: i64 = 842;
             let margin = 50.0;
             let line_height = 14.0;
-            let font_size = 11.0;
+            let font_size = 10.0;
+            let usable_width = page_w as f64 - 2.0 * margin;
+            // Average char width for Helvetica at 10pt ≈ 5.5 points
+            let avg_char_width = font_size * 0.52;
+            let max_chars_per_line = (usable_width / avg_char_width) as usize;
+            let lines_per_page = ((page_h as f64 - 2.0 * margin) / line_height) as usize;
+
+            // Word-wrap all lines
+            let raw_lines: Vec<&str> = plain_text.lines().collect();
+            let mut wrapped_lines: Vec<String> = Vec::new();
+            for line in &raw_lines {
+                if line.len() <= max_chars_per_line {
+                    wrapped_lines.push(line.to_string());
+                } else {
+                    // Word wrap
+                    let words: Vec<&str> = line.split_whitespace().collect();
+                    let mut current_line = String::new();
+                    for word in words {
+                        if current_line.is_empty() {
+                            if word.len() > max_chars_per_line {
+                                // Force-break very long words
+                                let mut remaining = word;
+                                while remaining.len() > max_chars_per_line {
+                                    let (part, rest) = remaining.split_at(max_chars_per_line);
+                                    wrapped_lines.push(part.to_string());
+                                    remaining = rest;
+                                }
+                                current_line = remaining.to_string();
+                            } else {
+                                current_line = word.to_string();
+                            }
+                        } else if current_line.len() + 1 + word.len() <= max_chars_per_line {
+                            current_line.push(' ');
+                            current_line.push_str(word);
+                        } else {
+                            wrapped_lines.push(current_line);
+                            current_line = word.to_string();
+                        }
+                    }
+                    wrapped_lines.push(current_line);
+                }
+            }
 
             let mut page_ids: Vec<lopdf::ObjectId> = Vec::new();
 
-            for chunk in lines.chunks(lines_per_page) {
+            for chunk in wrapped_lines.chunks(lines_per_page) {
                 // Build content stream as raw bytes for WinAnsi encoding
                 let mut content_bytes: Vec<u8> = Vec::new();
                 content_bytes.extend_from_slice(format!("BT\n/F1 {} Tf\n", font_size).as_bytes());
@@ -677,6 +1092,522 @@ fn convert_to_pdf(input: &str, output: &str) -> Result<String, String> {
     }
 }
 
+// ─── Archive conversion ─────────────────────────────────────────────
+
+fn convert_archive(input: &str, output: &str) -> Result<String, String> {
+    let in_ext = Path::new(input).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let out_ext = Path::new(output).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    match (in_ext.as_str(), out_ext.as_str()) {
+        // ZIP → TAR
+        ("zip", "tar") => {
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+            let tar_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut tar_builder = tar::Builder::new(tar_file);
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i).map_err(|e| format!("ZIP entry: {}", e))?;
+                if entry.is_dir() { continue; }
+                let name = entry.name().to_string();
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar_builder.append_data(&mut header, &name, &data[..])
+                    .map_err(|e| format!("TAR append: {}", e))?;
+            }
+            tar_builder.finish().map_err(|e| format!("TAR finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // ZIP → GZ (tar.gz)
+        ("zip", "gz") => {
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+            let gz_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+            let mut tar_builder = tar::Builder::new(encoder);
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i).map_err(|e| format!("ZIP entry: {}", e))?;
+                if entry.is_dir() { continue; }
+                let name = entry.name().to_string();
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar_builder.append_data(&mut header, &name, &data[..])
+                    .map_err(|e| format!("TAR append: {}", e))?;
+            }
+            tar_builder.finish().map_err(|e| format!("TAR finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // TAR → ZIP
+        ("tar", "zip") => {
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut archive = tar::Archive::new(file);
+            let zip_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut zip_writer = zip::ZipWriter::new(zip_file);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for entry in archive.entries().map_err(|e| format!("TAR read: {}", e))? {
+                let mut entry = entry.map_err(|e| format!("TAR entry: {}", e))?;
+                let path = entry.path().map_err(|e| format!("Path: {}", e))?.to_string_lossy().to_string();
+                if entry.header().entry_type().is_dir() { continue; }
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                zip_writer.start_file(&path, options).map_err(|e| format!("ZIP write: {}", e))?;
+                std::io::Write::write_all(&mut zip_writer, &data).map_err(|e| format!("Write: {}", e))?;
+            }
+            zip_writer.finish().map_err(|e| format!("ZIP finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // TAR → GZ (compress)
+        ("tar", "gz") => {
+            let data = fs::read(input).map_err(|e| format!("Read error: {}", e))?;
+            let gz_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+            std::io::Write::write_all(&mut encoder, &data).map_err(|e| format!("GZ write: {}", e))?;
+            encoder.finish().map_err(|e| format!("GZ finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // GZ → TAR (decompress)
+        ("gz", "tar") => {
+            let gz_file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut decoder = flate2::read::GzDecoder::new(gz_file);
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut data).map_err(|e| format!("GZ decompress: {}", e))?;
+            fs::write(output, data).map_err(|e| format!("Write error: {}", e))?;
+            Ok(output.to_string())
+        }
+        // GZ → ZIP
+        ("gz", "zip") => {
+            let gz_file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut decoder = flate2::read::GzDecoder::new(gz_file);
+            let mut tar_data = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut tar_data).map_err(|e| format!("GZ decompress: {}", e))?;
+            // Try as tar archive
+            let cursor = std::io::Cursor::new(&tar_data);
+            let mut archive = tar::Archive::new(cursor);
+            let zip_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut zip_writer = zip::ZipWriter::new(zip_file);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for entry in archive.entries().map_err(|e| format!("TAR read: {}", e))? {
+                let mut entry = entry.map_err(|e| format!("TAR entry: {}", e))?;
+                let path = entry.path().map_err(|e| format!("Path: {}", e))?.to_string_lossy().to_string();
+                if entry.header().entry_type().is_dir() { continue; }
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                zip_writer.start_file(&path, options).map_err(|e| format!("ZIP write: {}", e))?;
+                std::io::Write::write_all(&mut zip_writer, &data).map_err(|e| format!("Write: {}", e))?;
+            }
+            zip_writer.finish().map_err(|e| format!("ZIP finish: {}", e))?;
+            Ok(output.to_string())
+        }
+        // 7Z → ZIP
+        ("7z", "zip") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            sevenz_rust::decompress_file(input, &temp_dir)
+                .map_err(|e| format!("7z decompress: {}", e))?;
+            // Collect all extracted files into a ZIP
+            let zip_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut zip_writer = zip::ZipWriter::new(zip_file);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            fn add_dir_to_zip(zip_writer: &mut zip::ZipWriter<fs::File>, dir: &Path, base: &Path, options: zip::write::SimpleFileOptions) -> Result<(), String> {
+                for entry in fs::read_dir(dir).map_err(|e| format!("Read dir: {}", e))? {
+                    let entry = entry.map_err(|e| format!("Dir entry: {}", e))?;
+                    let path = entry.path();
+                    let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    if path.is_dir() {
+                        add_dir_to_zip(zip_writer, &path, base, options)?;
+                    } else {
+                        let data = fs::read(&path).map_err(|e| format!("Read: {}", e))?;
+                        zip_writer.start_file(&rel, options).map_err(|e| format!("ZIP: {}", e))?;
+                        std::io::Write::write_all(zip_writer, &data).map_err(|e| format!("Write: {}", e))?;
+                    }
+                }
+                Ok(())
+            }
+            add_dir_to_zip(&mut zip_writer, &temp_dir, &temp_dir, options)?;
+            zip_writer.finish().map_err(|e| format!("ZIP finish: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // 7Z → TAR
+        ("7z", "tar") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            sevenz_rust::decompress_file(input, &temp_dir)
+                .map_err(|e| format!("7z decompress: {}", e))?;
+            let tar_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let mut tar_builder = tar::Builder::new(tar_file);
+            fn add_dir_to_tar(builder: &mut tar::Builder<fs::File>, dir: &Path, base: &Path) -> Result<(), String> {
+                for entry in fs::read_dir(dir).map_err(|e| format!("Read dir: {}", e))? {
+                    let entry = entry.map_err(|e| format!("Dir entry: {}", e))?;
+                    let path = entry.path();
+                    let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    if path.is_dir() {
+                        add_dir_to_tar(builder, &path, base)?;
+                    } else {
+                        let data = fs::read(&path).map_err(|e| format!("Read: {}", e))?;
+                        let mut header = tar::Header::new_gnu();
+                        header.set_size(data.len() as u64);
+                        header.set_mode(0o644);
+                        header.set_cksum();
+                        builder.append_data(&mut header, &rel, &data[..])
+                            .map_err(|e| format!("TAR append: {}", e))?;
+                    }
+                }
+                Ok(())
+            }
+            add_dir_to_tar(&mut tar_builder, &temp_dir, &temp_dir)?;
+            tar_builder.finish().map_err(|e| format!("TAR finish: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // 7Z → GZ (tar.gz)
+        ("7z", "gz") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            sevenz_rust::decompress_file(input, &temp_dir)
+                .map_err(|e| format!("7z decompress: {}", e))?;
+            let gz_file = fs::File::create(output).map_err(|e| format!("Create error: {}", e))?;
+            let encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
+            let mut tar_builder = tar::Builder::new(encoder);
+            fn add_dir_to_targz<W: std::io::Write>(builder: &mut tar::Builder<W>, dir: &Path, base: &Path) -> Result<(), String> {
+                for entry in fs::read_dir(dir).map_err(|e| format!("Read dir: {}", e))? {
+                    let entry = entry.map_err(|e| format!("Dir entry: {}", e))?;
+                    let path = entry.path();
+                    let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    if path.is_dir() {
+                        add_dir_to_targz(builder, &path, base)?;
+                    } else {
+                        let data = fs::read(&path).map_err(|e| format!("Read: {}", e))?;
+                        let mut header = tar::Header::new_gnu();
+                        header.set_size(data.len() as u64);
+                        header.set_mode(0o644);
+                        header.set_cksum();
+                        builder.append_data(&mut header, &rel, &data[..])
+                            .map_err(|e| format!("TAR append: {}", e))?;
+                    }
+                }
+                Ok(())
+            }
+            add_dir_to_targz(&mut tar_builder, &temp_dir, &temp_dir)?;
+            tar_builder.into_inner().map_err(|e| format!("GZ finish: {}", e))?
+                .finish().map_err(|e| format!("GZ finish: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // ZIP → 7Z
+        ("zip", "7z") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_to7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("ZIP error: {}", e))?;
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i).map_err(|e| format!("ZIP entry: {}", e))?;
+                let out_path = temp_dir.join(entry.name());
+                if entry.is_dir() {
+                    fs::create_dir_all(&out_path).map_err(|e| format!("Dir: {}", e))?;
+                } else {
+                    if let Some(parent) = out_path.parent() {
+                        fs::create_dir_all(parent).map_err(|e| format!("Dir: {}", e))?;
+                    }
+                    let mut data = Vec::new();
+                    std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| format!("Read: {}", e))?;
+                    fs::write(&out_path, data).map_err(|e| format!("Write: {}", e))?;
+                }
+            }
+            sevenz_rust::compress_to_path(&temp_dir, output)
+                .map_err(|e| format!("7z compress: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // TAR → 7Z
+        ("tar", "7z") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_to7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            let file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let mut archive = tar::Archive::new(file);
+            archive.unpack(&temp_dir).map_err(|e| format!("TAR unpack: {}", e))?;
+            sevenz_rust::compress_to_path(&temp_dir, output)
+                .map_err(|e| format!("7z compress: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        // GZ → 7Z
+        ("gz", "7z") => {
+            let temp_dir = std::env::temp_dir().join(format!("omni_to7z_{}", std::process::id()));
+            fs::create_dir_all(&temp_dir).map_err(|e| format!("Temp dir: {}", e))?;
+            let gz_file = fs::File::open(input).map_err(|e| format!("Read error: {}", e))?;
+            let decoder = flate2::read::GzDecoder::new(gz_file);
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(&temp_dir).map_err(|e| format!("GZ/TAR unpack: {}", e))?;
+            sevenz_rust::compress_to_path(&temp_dir, output)
+                .map_err(|e| format!("7z compress: {}", e))?;
+            let _ = fs::remove_dir_all(&temp_dir);
+            Ok(output.to_string())
+        }
+        _ => Err(format!("Conversion from {} to {} is not supported yet", in_ext, out_ext)),
+    }
+}
+
+// ─── PDF as source conversion ───────────────────────────────────────
+
+/// Find ImageMagick executable (checks common install paths on Windows)
+fn find_magick() -> String {
+    if cfg!(windows) {
+        // Check PATH first
+        if let Ok(output) = Command::new("magick").arg("--version").output() {
+            if output.status.success() {
+                return "magick".to_string();
+            }
+        }
+        // Check common Windows install paths
+        let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+        let candidates = [
+            format!("{}\\ImageMagick-7.1.1-Q16-HDRI\\magick.exe", program_files),
+            format!("{}\\ImageMagick\\magick.exe", program_files),
+        ];
+        // Also search in Program Files for any ImageMagick folder
+        if let Ok(entries) = fs::read_dir(&program_files) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("ImageMagick") {
+                    let magick_path = entry.path().join("magick.exe");
+                    if magick_path.exists() {
+                        return magick_path.to_string_lossy().to_string();
+                    }
+                }
+            }
+        }
+        for path in &candidates {
+            if Path::new(path).exists() {
+                return path.clone();
+            }
+        }
+        "magick".to_string()
+    } else {
+        "convert".to_string()
+    }
+}
+
+/// Extract text from PDF: try pdftotext first, fallback to lopdf, then OCR
+fn extract_pdf_text(input: &str) -> Result<String, String> {
+    // Try pdftotext (poppler-utils) first — much better extraction
+    if let Ok(output) = Command::new("pdftotext")
+        .arg("-layout")
+        .arg(input)
+        .arg("-")
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            if !text.trim().is_empty() {
+                return Ok(text);
+            }
+        }
+    }
+
+    // Fallback: lopdf
+    let doc = lopdf::Document::load(input)
+        .map_err(|e| format!("PDF load error: {}", e))?;
+    let mut text = String::new();
+    let pages = doc.get_pages();
+    for page_num in 1..=pages.len() as u32 {
+        if let Ok(page_text) = doc.extract_text(&[page_num]) {
+            text.push_str(&page_text);
+            text.push('\n');
+        }
+    }
+
+    if !text.trim().is_empty() {
+        return Ok(text);
+    }
+
+    // Last resort: OCR via Tesseract
+    // First convert PDF to image, then OCR
+    let magick = find_magick();
+    let temp_img = std::env::temp_dir().join(format!("omni_pdf_ocr_{}.png", std::process::id()));
+    let temp_img_str = temp_img.to_string_lossy().to_string();
+
+    // Try ImageMagick to render PDF page to image
+    let img_result = Command::new(&magick)
+        .arg("-density").arg("300")
+        .arg(format!("{}[0]", input))
+        .arg("-depth").arg("8")
+        .arg(&temp_img_str)
+        .output();
+
+    let has_image = match img_result {
+        Ok(o) if o.status.success() && temp_img.exists() => true,
+        _ => {
+            // Try pdftoppm fallback
+            let temp_prefix = std::env::temp_dir().join(format!("omni_pdf_ocr_{}", std::process::id()));
+            let r = Command::new("pdftoppm")
+                .arg("-png").arg("-f").arg("1").arg("-l").arg("1")
+                .arg("-singlefile").arg("-r").arg("300")
+                .arg(input)
+                .arg(temp_prefix.to_string_lossy().to_string())
+                .output();
+            match r {
+                Ok(o) if o.status.success() => {
+                    let expected = format!("{}.png", temp_prefix.to_string_lossy());
+                    if Path::new(&expected).exists() {
+                        let _ = fs::rename(&expected, &temp_img_str);
+                        true
+                    } else { false }
+                }
+                _ => false,
+            }
+        }
+    };
+
+    if has_image {
+        // Run Tesseract OCR on the image
+        let tesseract = if cfg!(windows) { "tesseract" } else { "tesseract" };
+        // Try French first, then English, then no language specified
+        for lang in &["fra+eng", "eng", ""] {
+            let mut cmd = Command::new(tesseract);
+            cmd.arg(&temp_img_str).arg("stdout");
+            if !lang.is_empty() {
+                cmd.arg("-l").arg(lang);
+            }
+            if let Ok(output) = cmd.output() {
+                if output.status.success() {
+                    let ocr_text = String::from_utf8_lossy(&output.stdout).to_string();
+                    let _ = fs::remove_file(&temp_img);
+                    if !ocr_text.trim().is_empty() {
+                        return Ok(ocr_text);
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(&temp_img);
+    }
+
+    Ok("(No extractable text found in PDF — the document may contain scanned images. Install Tesseract and ImageMagick for OCR extraction.)".to_string())
+}
+
+fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
+    let out_ext = Path::new(output).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    match out_ext.as_str() {
+        // PDF → text-based formats: extract text then convert
+        "txt" | "md" | "html" | "rtf" | "docx" => {
+            let text = extract_pdf_text(input)?;
+
+            match out_ext.as_str() {
+                "txt" | "md" => {
+                    fs::write(output, &text).map_err(|e| format!("Write error: {}", e))?;
+                    Ok(output.to_string())
+                }
+                "html" => {
+                    let title = Path::new(input).file_stem().and_then(|s| s.to_str()).unwrap_or("document");
+                    let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                    let html = format!(
+                        "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n<pre>{}</pre>\n</body>\n</html>",
+                        title, escaped
+                    );
+                    fs::write(output, &html).map_err(|e| format!("Write error: {}", e))?;
+                    Ok(output.to_string())
+                }
+                "rtf" => {
+                    let mut rtf = String::from("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Calibri;}}\n");
+                    for line in text.lines() {
+                        let escaped: String = line.chars().map(|c| match c {
+                            '\\' => "\\\\".to_string(),
+                            '{' => "\\{".to_string(),
+                            '}' => "\\}".to_string(),
+                            c if (c as u32) > 127 => format!("\\u{}?", c as i16),
+                            c => c.to_string(),
+                        }).collect();
+                        rtf.push_str(&escaped);
+                        rtf.push_str("\\par\n");
+                    }
+                    rtf.push('}');
+                    fs::write(output, &rtf).map_err(|e| format!("Write error: {}", e))?;
+                    Ok(output.to_string())
+                }
+                "docx" => create_docx_from_text(&text, output),
+                _ => unreachable!(),
+            }
+        }
+        // PDF → image formats: use ImageMagick or pdftoppm
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" => {
+            let magick = find_magick();
+
+            // Try ImageMagick first (most common on Windows)
+            let result = Command::new(&magick)
+                .arg("-density").arg("200")
+                .arg(format!("{}[0]", input))
+                .arg("-quality").arg("95")
+                .arg(output)
+                .output();
+
+            match result {
+                Ok(out) if out.status.success() => {
+                    // If target is webp/bmp and ImageMagick doesn't support it, convert via image crate
+                    if Path::new(output).exists() {
+                        return Ok(output.to_string());
+                    }
+                }
+                _ => {}
+            }
+
+            // Fallback: try pdftoppm
+            let temp_prefix = std::env::temp_dir().join(format!("omni_pdf2img_{}", std::process::id()));
+            let temp_prefix_str = temp_prefix.to_string_lossy().to_string();
+            let fmt_flag = match out_ext.as_str() {
+                "jpg" | "jpeg" => "-jpeg",
+                "png" | "webp" | "bmp" => "-png",
+                "tiff" => "-tiff",
+                _ => "-png",
+            };
+            let result = Command::new("pdftoppm")
+                .arg(fmt_flag)
+                .arg("-f").arg("1").arg("-l").arg("1")
+                .arg("-singlefile").arg("-r").arg("200")
+                .arg(input)
+                .arg(&temp_prefix_str)
+                .output();
+
+            match result {
+                Ok(out) if out.status.success() => {
+                    let expected_ext = match out_ext.as_str() {
+                        "jpg" | "jpeg" => "jpg",
+                        "tiff" => "tif",
+                        _ => "png",
+                    };
+                    let temp_file = format!("{}.{}", temp_prefix_str, expected_ext);
+                    if Path::new(&temp_file).exists() {
+                        if out_ext == "webp" || out_ext == "bmp" {
+                            let img = image::open(&temp_file).map_err(|e| format!("Image open: {}", e))?;
+                            let fmt = match out_ext.as_str() {
+                                "webp" => ImageFormat::WebP,
+                                "bmp" => ImageFormat::Bmp,
+                                _ => ImageFormat::Png,
+                            };
+                            img.save_with_format(output, fmt).map_err(|e| format!("Image save: {}", e))?;
+                        } else {
+                            fs::copy(&temp_file, output).map_err(|e| format!("Copy: {}", e))?;
+                        }
+                        let _ = fs::remove_file(&temp_file);
+                        return Ok(output.to_string());
+                    }
+                }
+                _ => {}
+            }
+
+            Err("PDF to image requires ImageMagick (magick) or poppler-utils (pdftoppm). Please install one and restart your computer.".to_string())
+        }
+        _ => Err(format!("PDF conversion to {} is not supported yet", out_ext)),
+    }
+}
+
 // ─── Tauri Commands ────────────────────────────────────────────────
 
 #[tauri::command]
@@ -701,6 +1632,7 @@ fn convert_file(
         "csv" | "json" | "xml" | "yaml" | "yml" | "xls" | "xlsx" | "ods" => "data",
         "txt" | "md" | "html" | "rtf" | "docx" => "text",
         "zip" | "rar" | "7z" | "tar" | "gz" => "archive",
+        "pdf" => "pdf",
         _ => "unknown",
     };
 
@@ -742,6 +1674,8 @@ fn convert_file(
         }
         "data" => convert_data(&input_path, &output_path),
         "text" => convert_text(&input_path, &output_path),
+        "archive" => convert_archive(&input_path, &output_path),
+        "pdf" => convert_from_pdf(&input_path, &output_path),
         _ => Err(format!(
             "Conversion from {} to {} is not supported yet",
             in_ext, target_format
@@ -911,21 +1845,172 @@ fn rotate_pdf(
 }
 
 #[tauri::command]
-fn compress_pdf(input_path: String, output_path: String, _quality: String) -> Result<String, String> {
+fn compress_pdf(input_path: String, output_path: String, quality: String) -> Result<String, String> {
+    let original_size = fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
+
+    // Determine image quality/max dimension based on compression level
+    let (img_quality, max_dim) = match quality.as_str() {
+        "low" => (35u8, 800u32),      // Aggressive: low quality, small images
+        "medium" => (55u8, 1200u32),   // Balanced
+        "high" => (75u8, 1600u32),     // Light: decent quality, reasonable images
+        _ => (55u8, 1200u32),
+    };
+
     let mut doc = lopdf::Document::load(&input_path)
         .map_err(|e| format!("PDF load error: {}", e))?;
 
+    // 1. Remove metadata, unused objects
+    doc.prune_objects();
+    doc.delete_zero_length_streams();
+    doc.renumber_objects();
+
+    // 2. Compress/downscale embedded images
+    let object_ids: Vec<lopdf::ObjectId> = doc.objects.keys().cloned().collect();
+    for id in object_ids {
+        // Check if this object is an image stream
+        let image_info = {
+            if let Ok(Object::Stream(ref stream)) = doc.get_object(id) {
+                let dict = &stream.dict;
+                let is_image = match dict.get(b"Subtype") {
+                    Ok(Object::Name(ref s)) => s == b"Image",
+                    _ => false,
+                };
+                if !is_image { None }
+                else {
+                    let w = match dict.get(b"Width") {
+                        Ok(Object::Integer(n)) => *n as u32,
+                        _ => continue,
+                    };
+                    let h = match dict.get(b"Height") {
+                        Ok(Object::Integer(n)) => *n as u32,
+                        _ => continue,
+                    };
+                    // Detect current filter (compression type)
+                    let filter = match dict.get(b"Filter") {
+                        Ok(Object::Name(ref f)) => String::from_utf8_lossy(f).to_string(),
+                        Ok(Object::Array(ref arr)) => {
+                            if let Some(Object::Name(ref f)) = arr.last() {
+                                String::from_utf8_lossy(f).to_string()
+                            } else { String::new() }
+                        }
+                        _ => String::new(),
+                    };
+                    let channels = match dict.get(b"ColorSpace") {
+                        Ok(Object::Name(ref cs)) if cs == b"DeviceGray" => 1u32,
+                        Ok(Object::Name(ref cs)) if cs == b"DeviceCMYK" => 4u32,
+                        _ => 3u32, // Default to RGB
+                    };
+                    Some((w, h, filter, channels))
+                }
+            } else { None }
+        };
+
+        let (width, height, filter, channels) = match image_info {
+            Some(info) => info,
+            None => continue,
+        };
+
+        // Get the raw stream content
+        let raw_data = {
+            if let Ok(Object::Stream(ref stream)) = doc.get_object(id) {
+                stream.content.clone()
+            } else { continue; }
+        };
+
+        // Try to decode the image data into a DynamicImage
+        let img: Option<image::DynamicImage> = if filter == "DCTDecode" {
+            // Already JPEG — decode it with image crate
+            image::load_from_memory_with_format(&raw_data, ImageFormat::Jpeg).ok()
+        } else {
+            // Try decompressing (FlateDecode etc.) then interpreting as raw pixels
+            let pixel_data = {
+                if let Ok(Object::Stream(ref mut stream)) = doc.get_object_mut(id) {
+                    let _ = stream.decompress();
+                    stream.content.clone()
+                } else { continue; }
+            };
+            let expected = (width * height * channels) as usize;
+            if pixel_data.len() == expected {
+                if channels == 3 {
+                    image::RgbImage::from_raw(width, height, pixel_data)
+                        .map(image::DynamicImage::ImageRgb8)
+                } else if channels == 1 {
+                    image::GrayImage::from_raw(width, height, pixel_data)
+                        .map(image::DynamicImage::ImageLuma8)
+                } else {
+                    None // CMYK etc. — skip
+                }
+            } else {
+                // Maybe it's a PNG or other format in the stream
+                image::load_from_memory(&pixel_data).ok()
+            }
+        };
+
+        let img = match img {
+            Some(i) => i,
+            None => continue,
+        };
+
+        // Resize if larger than max_dim
+        let resized = if img.width() > max_dim || img.height() > max_dim {
+            img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+
+        // Re-encode as JPEG at target quality
+        let new_w = resized.width();
+        let new_h = resized.height();
+        let mut jpeg_buf = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut jpeg_buf);
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, img_quality);
+            if resized.write_with_encoder(encoder).is_err() {
+                continue;
+            }
+        }
+
+        // Only replace if new JPEG is actually smaller
+        if jpeg_buf.is_empty() || jpeg_buf.len() >= raw_data.len() {
+            continue;
+        }
+
+        // Replace the stream with JPEG data
+        if let Ok(Object::Stream(ref mut stream)) = doc.get_object_mut(id) {
+            stream.dict.set("Width", Object::Integer(new_w as i64));
+            stream.dict.set("Height", Object::Integer(new_h as i64));
+            stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+            stream.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+            stream.dict.set("BitsPerComponent", Object::Integer(8));
+            stream.dict.set("Length", Object::Integer(jpeg_buf.len() as i64));
+            stream.dict.remove(b"DecodeParms");
+            stream.dict.remove(b"SMask");
+            stream.content = jpeg_buf;
+            stream.allows_compression = false; // Already JPEG
+        }
+    }
+
+    // 3. Compress all remaining streams
     doc.compress();
 
     doc.save(&output_path)
         .map_err(|e| format!("Save error: {}", e))?;
 
-    let original_size = fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
     let compressed_size = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
 
+    // If compression made it bigger, just copy the original
+    if compressed_size >= original_size {
+        fs::copy(&input_path, &output_path).map_err(|e| format!("Copy error: {}", e))?;
+        return Ok(format!(
+            "PDF already optimized ({} bytes). No further compression possible.",
+            original_size
+        ));
+    }
+
+    let saved_pct = ((original_size as f64 - compressed_size as f64) / original_size as f64 * 100.0) as u32;
     Ok(format!(
-        "Compressed: {} → {} bytes",
-        original_size, compressed_size
+        "Compressed: {} → {} bytes (-{}%)",
+        original_size, compressed_size, saved_pct
     ))
 }
 
