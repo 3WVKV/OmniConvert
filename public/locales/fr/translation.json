@@ -130,7 +130,9 @@
     "videoInfo": "Info vidéo",
     "duration": "Durée",
     "resolution": "Résolution",
-    "codec": "Codec"
+    "codec": "Codec",
+    "loadingTimeline": "Chargement de la timeline...",
+    "trimHint": "Glissez les poignées sur la timeline pour ajuster les points de coupe"
   },
   "errors": {
     "tesseractNotInstalled": "Tesseract OCR n'est pas installé. Téléchargez-le ici : https://github.com/UB-Mannheim/tesseract/wiki puis redémarrez l'application.",

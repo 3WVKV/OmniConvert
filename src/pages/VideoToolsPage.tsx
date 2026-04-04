@@ -1,6 +1,7 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { DropZone } from "@/components/shared/DropZone";
 import { Button } from "@/components/ui/button";
@@ -10,10 +11,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-// ScrollArea available if needed
 import {
   Scissors, Merge, Music, Maximize, Minimize2, Image as ImageIcon,
-  RotateCw, VolumeX, Camera, Loader2, X, Film, Plus,
+  RotateCw, VolumeX, Camera, Loader2, X, Film, Plus, Play, Pause,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -31,10 +31,23 @@ export function VideoToolsPage() {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [fileName, setFileName] = useState("");
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
+  const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [processing, setProcessing] = useState(false);
   const [activeTab, setActiveTab] = useState("trim");
 
+  // Video player state
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+
+  // Timeline thumbnails
+  const [thumbnails, setThumbnails] = useState<string[]>([]);
+  const [loadingThumbs, setLoadingThumbs] = useState(false);
+
   // Trim
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(10);
   const [startTime, setStartTime] = useState("00:00:00");
   const [endTime, setEndTime] = useState("00:00:10");
 
@@ -58,6 +71,20 @@ export function VideoToolsPage() {
   // Thumbnail
   const [frameTime, setFrameTime] = useState("00:00:01");
 
+  const formatTimeCode = (secs: number): string => {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  };
+
+  const parseTimeCode = (tc: string): number => {
+    const parts = tc.split(":").map(Number);
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return parts[0] || 0;
+  };
+
   const handlePaths = useCallback(async (paths: string[]) => {
     const path = paths[0];
     if (!path) return;
@@ -65,13 +92,30 @@ export function VideoToolsPage() {
       const info = await invoke<{ name: string; size: number; extension: string }>("get_file_info", { path });
       setFilePath(path);
       setFileName(info.name);
-      // Try to get media info
+      setVideoSrc(convertFileSrc(path));
+      setThumbnails([]);
+
       try {
         const mediaInfo = await invoke<VideoInfo>("get_media_info", { path });
         setVideoInfo(mediaInfo);
+        const dur = parseFloat(mediaInfo.duration);
+        if (!isNaN(dur)) {
+          setTrimEnd(dur);
+          setEndTime(formatTimeCode(dur));
+        }
       } catch {
         setVideoInfo(null);
       }
+
+      // Load timeline thumbnails
+      setLoadingThumbs(true);
+      try {
+        const thumbs = await invoke<string[]>("ffmpeg_timeline_thumbnails", { inputPath: path, count: 15 });
+        setThumbnails(thumbs);
+      } catch {
+        // Thumbnails are optional
+      }
+      setLoadingThumbs(false);
     } catch (err) {
       toast.error(String(err));
     }
@@ -207,13 +251,75 @@ export function VideoToolsPage() {
     return `${(bytes / 1048576).toFixed(1)} MB`;
   };
 
-  const formatDuration = (dur: string) => {
-    const secs = parseFloat(dur);
-    if (isNaN(secs)) return dur;
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    const s = Math.floor(secs % 60);
-    return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  const togglePlay = () => {
+    if (!videoRef.current) return;
+    if (isPlaying) {
+      videoRef.current.pause();
+    } else {
+      videoRef.current.play();
+    }
+    setIsPlaying(!isPlaying);
+  };
+
+  const handleVideoTimeUpdate = () => {
+    if (!videoRef.current) return;
+    setCurrentTime(videoRef.current.currentTime);
+  };
+
+  const handleVideoLoaded = () => {
+    if (!videoRef.current) return;
+    setDuration(videoRef.current.duration);
+    if (videoRef.current.duration && trimEnd === 10) {
+      setTrimEnd(videoRef.current.duration);
+      setEndTime(formatTimeCode(videoRef.current.duration));
+    }
+  };
+
+  const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!videoRef.current || !duration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const newTime = x * duration;
+    videoRef.current.currentTime = newTime;
+    setCurrentTime(newTime);
+  };
+
+  // Update trim handles from input fields
+  useEffect(() => {
+    setTrimStart(parseTimeCode(startTime));
+  }, [startTime]);
+
+  useEffect(() => {
+    setTrimEnd(parseTimeCode(endTime));
+  }, [endTime]);
+
+  const handleTrimDrag = (e: React.MouseEvent<HTMLDivElement>, handle: "start" | "end") => {
+    e.stopPropagation();
+    const timeline = e.currentTarget.parentElement;
+    if (!timeline || !duration) return;
+
+    const onMove = (ev: MouseEvent) => {
+      const rect = timeline.getBoundingClientRect();
+      const x = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      const time = x * duration;
+      if (handle === "start") {
+        const clamped = Math.min(time, trimEnd - 0.5);
+        setTrimStart(Math.max(0, clamped));
+        setStartTime(formatTimeCode(Math.max(0, clamped)));
+      } else {
+        const clamped = Math.max(time, trimStart + 0.5);
+        setTrimEnd(Math.min(duration, clamped));
+        setEndTime(formatTimeCode(Math.min(duration, clamped)));
+      }
+    };
+
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
   };
 
   return (
@@ -241,14 +347,17 @@ export function VideoToolsPage() {
                 <div className="space-y-1">
                   <div className="flex items-center justify-between">
                     <p className="text-sm font-medium truncate flex-1">{fileName}</p>
-                    <Button variant="ghost" size="icon" className="h-6 w-6 shrink-0" onClick={() => { setFilePath(null); setVideoInfo(null); }}>
+                    <Button variant="ghost" size="icon" className="h-6 w-6 shrink-0" onClick={() => {
+                      setFilePath(null); setVideoInfo(null); setVideoSrc(null);
+                      setThumbnails([]); setIsPlaying(false); setCurrentTime(0); setDuration(0);
+                    }}>
                       <X className="h-3 w-3" />
                     </Button>
                   </div>
                   {videoInfo && (
                     <div className="text-xs text-muted-foreground space-y-0.5">
                       {videoInfo.duration !== "unknown" && (
-                        <p>{t("videoTools.duration")}: {formatDuration(videoInfo.duration)}</p>
+                        <p>{t("videoTools.duration")}: {formatTimeCode(parseFloat(videoInfo.duration))}</p>
                       )}
                       {videoInfo.resolution !== "unknown" && (
                         <p>{t("videoTools.resolution")}: {videoInfo.resolution}</p>
@@ -309,6 +418,9 @@ export function VideoToolsPage() {
                     <Label className="text-xs">{t("videoTools.endTime")} ({t("videoTools.timeFormat")})</Label>
                     <Input value={endTime} onChange={(e) => setEndTime(e.target.value)} placeholder="00:00:10" />
                   </div>
+                  <p className="text-xs text-muted-foreground">
+                    {t("videoTools.trimHint") || "Drag the handles on the timeline to adjust"}
+                  </p>
                 </TabsContent>
 
                 <TabsContent value="merge" className="mt-0 space-y-3">
@@ -421,22 +533,125 @@ export function VideoToolsPage() {
             </div>
           </div>
 
-          {/* Right: video preview area */}
-          <div className="flex flex-1 flex-col items-center justify-center min-h-0 rounded-lg border bg-card">
-            {filePath ? (
-              <div className="flex flex-col items-center gap-4 p-8 text-center">
-                <Film className="h-16 w-16 text-muted-foreground" />
-                <div>
-                  <p className="text-lg font-medium">{fileName}</p>
-                  {videoInfo && videoInfo.duration !== "unknown" && (
-                    <p className="text-sm text-muted-foreground">
-                      {formatDuration(videoInfo.duration)} • {videoInfo.resolution} • {formatBytes(videoInfo.file_size)}
-                    </p>
+          {/* Right: video preview + timeline */}
+          <div className="flex flex-1 flex-col min-h-0 rounded-lg border bg-card overflow-hidden">
+            {videoSrc ? (
+              <>
+                {/* Video player */}
+                <div className="flex-1 flex items-center justify-center bg-black min-h-0 relative">
+                  <video
+                    ref={videoRef}
+                    src={videoSrc}
+                    className="max-w-full max-h-full"
+                    onTimeUpdate={handleVideoTimeUpdate}
+                    onLoadedMetadata={handleVideoLoaded}
+                    onEnded={() => setIsPlaying(false)}
+                    onClick={togglePlay}
+                  />
+                  {!isPlaying && (
+                    <button
+                      onClick={togglePlay}
+                      className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/30 transition-colors"
+                    >
+                      <Play className="h-16 w-16 text-white/80" fill="white" fillOpacity={0.8} />
+                    </button>
                   )}
                 </div>
-              </div>
+
+                {/* Controls bar */}
+                <div className="flex items-center gap-3 px-4 py-2 border-t bg-card">
+                  <Button variant="ghost" size="icon" className="h-8 w-8" onClick={togglePlay}>
+                    {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                  </Button>
+                  <span className="text-xs font-mono text-muted-foreground min-w-[70px]">
+                    {formatTimeCode(currentTime)}
+                  </span>
+                  <div className="flex-1" />
+                  <span className="text-xs font-mono text-muted-foreground min-w-[70px] text-right">
+                    {formatTimeCode(duration)}
+                  </span>
+                </div>
+
+                {/* Timeline with thumbnails */}
+                <div className="px-4 pb-3">
+                  <div
+                    className="relative h-16 rounded-md overflow-hidden cursor-pointer bg-muted border"
+                    onClick={handleTimelineClick}
+                  >
+                    {/* Thumbnail strip */}
+                    {thumbnails.length > 0 ? (
+                      <div className="flex h-full w-full">
+                        {thumbnails.map((thumb, i) => (
+                          <img
+                            key={i}
+                            src={`data:image/jpeg;base64,${thumb}`}
+                            alt=""
+                            className="h-full object-cover"
+                            style={{ width: `${100 / thumbnails.length}%` }}
+                            draggable={false}
+                          />
+                        ))}
+                      </div>
+                    ) : loadingThumbs ? (
+                      <div className="flex items-center justify-center h-full text-xs text-muted-foreground">
+                        <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                        {t("videoTools.loadingTimeline") || "Loading timeline..."}
+                      </div>
+                    ) : (
+                      <div className="h-full bg-muted" />
+                    )}
+
+                    {/* Trim region overlay (only in trim mode) */}
+                    {activeTab === "trim" && duration > 0 && (
+                      <>
+                        {/* Darkened areas outside trim region */}
+                        <div
+                          className="absolute top-0 bottom-0 left-0 bg-black/60"
+                          style={{ width: `${(trimStart / duration) * 100}%` }}
+                        />
+                        <div
+                          className="absolute top-0 bottom-0 right-0 bg-black/60"
+                          style={{ width: `${((duration - trimEnd) / duration) * 100}%` }}
+                        />
+
+                        {/* Trim start handle */}
+                        <div
+                          className="absolute top-0 bottom-0 w-1.5 bg-primary cursor-col-resize z-10 hover:bg-primary/80"
+                          style={{ left: `calc(${(trimStart / duration) * 100}% - 3px)` }}
+                          onMouseDown={(e) => handleTrimDrag(e, "start")}
+                        >
+                          <div className="absolute -top-4 left-1/2 -translate-x-1/2 text-[10px] font-mono bg-primary text-primary-foreground px-1 rounded">
+                            {formatTimeCode(trimStart)}
+                          </div>
+                        </div>
+
+                        {/* Trim end handle */}
+                        <div
+                          className="absolute top-0 bottom-0 w-1.5 bg-primary cursor-col-resize z-10 hover:bg-primary/80"
+                          style={{ left: `calc(${(trimEnd / duration) * 100}% - 3px)` }}
+                          onMouseDown={(e) => handleTrimDrag(e, "end")}
+                        >
+                          <div className="absolute -top-4 left-1/2 -translate-x-1/2 text-[10px] font-mono bg-primary text-primary-foreground px-1 rounded">
+                            {formatTimeCode(trimEnd)}
+                          </div>
+                        </div>
+                      </>
+                    )}
+
+                    {/* Playhead */}
+                    {duration > 0 && (
+                      <div
+                        className="absolute top-0 bottom-0 w-0.5 bg-red-500 z-20 pointer-events-none"
+                        style={{ left: `${(currentTime / duration) * 100}%` }}
+                      >
+                        <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-2.5 h-2.5 bg-red-500 rounded-full" />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </>
             ) : (
-              <div className="flex flex-col items-center gap-2 text-muted-foreground">
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
                 <Film className="h-12 w-12" />
                 <p className="text-sm">{t("videoTools.loadVideo")}</p>
               </div>

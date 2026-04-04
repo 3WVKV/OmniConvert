@@ -2448,6 +2448,55 @@ fn ffmpeg_thumbnail(input_path: String, output_path: String, time: String) -> Re
 }
 
 #[tauri::command]
+fn ffmpeg_timeline_thumbnails(input_path: String, count: u32) -> Result<Vec<String>, String> {
+    let ffmpeg = find_ffmpeg();
+    let ffprobe = ffmpeg.replace("ffmpeg", "ffprobe");
+
+    // Get duration via ffprobe
+    let probe = Command::new(&ffprobe)
+        .args(["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", &input_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    let duration: f64 = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(10.0);
+
+    let count = count.min(30).max(5);
+    let interval = duration / count as f64;
+    let temp_dir = std::env::temp_dir().join("omniconvert_thumbs");
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let mut base64_thumbs = Vec::new();
+    for i in 0..count {
+        let time = interval * i as f64 + interval / 2.0;
+        let thumb_path = temp_dir.join(format!("thumb_{}.jpg", i));
+        let output = Command::new(&ffmpeg)
+            .args([
+                "-y", "-ss", &format!("{:.3}", time),
+                "-i", &input_path,
+                "-vframes", "1",
+                "-vf", "scale=160:-1",
+                "-q:v", "6",
+                thumb_path.to_str().unwrap_or(""),
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(data) = fs::read(&thumb_path) {
+                    base64_thumbs.push(STANDARD.encode(&data));
+                }
+            }
+        }
+        let _ = fs::remove_file(&thumb_path);
+    }
+
+    let _ = fs::remove_dir(&temp_dir);
+    Ok(base64_thumbs)
+}
+
+#[tauri::command]
 fn get_media_info(path: String) -> Result<MediaInfo, String> {
     let ffmpeg = find_ffmpeg();
     // Use ffprobe if available, otherwise parse ffmpeg stderr
@@ -2648,6 +2697,7 @@ pub fn run() {
             ffmpeg_rotate,
             ffmpeg_remove_audio,
             ffmpeg_thumbnail,
+            ffmpeg_timeline_thumbnails,
             get_media_info,
         ])
         .run(tauri::generate_context!())
