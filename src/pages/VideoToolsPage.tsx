@@ -71,18 +71,28 @@ export function VideoToolsPage() {
   // Thumbnail
   const [frameTime, setFrameTime] = useState("00:00:01");
 
-  const formatTimeCode = (secs: number): string => {
+  const formatTimeCode = (secs: number, ms = false): string => {
     const h = Math.floor(secs / 3600);
     const m = Math.floor((secs % 3600) / 60);
     const s = Math.floor(secs % 60);
-    return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+    const base = `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+    if (ms) {
+      const millis = Math.round((secs % 1) * 1000);
+      return `${base}.${millis.toString().padStart(3, "0")}`;
+    }
+    return base;
   };
 
   const parseTimeCode = (tc: string): number => {
-    const parts = tc.split(":").map(Number);
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    if (parts.length === 2) return parts[0] * 60 + parts[1];
-    return parts[0] || 0;
+    // Support HH:MM:SS.mmm format
+    const [timePart, msPart] = tc.split(".");
+    const parts = timePart.split(":").map(Number);
+    let seconds = 0;
+    if (parts.length === 3) seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    else if (parts.length === 2) seconds = parts[0] * 60 + parts[1];
+    else seconds = parts[0] || 0;
+    if (msPart) seconds += parseInt(msPart.padEnd(3, "0").slice(0, 3)) / 1000;
+    return seconds;
   };
 
   const handlePaths = useCallback(async (paths: string[]) => {
@@ -305,11 +315,11 @@ export function VideoToolsPage() {
       if (handle === "start") {
         const clamped = Math.min(time, trimEnd - 0.5);
         setTrimStart(Math.max(0, clamped));
-        setStartTime(formatTimeCode(Math.max(0, clamped)));
+        setStartTime(formatTimeCode(Math.max(0, clamped), true));
       } else {
         const clamped = Math.max(time, trimStart + 0.5);
         setTrimEnd(Math.min(duration, clamped));
-        setEndTime(formatTimeCode(Math.min(duration, clamped)));
+        setEndTime(formatTimeCode(Math.min(duration, clamped), true));
       }
     };
 
@@ -620,8 +630,8 @@ export function VideoToolsPage() {
                           style={{ left: `calc(${(trimStart / duration) * 100}% - 3px)` }}
                           onMouseDown={(e) => handleTrimDrag(e, "start")}
                         >
-                          <div className="absolute -top-4 left-1/2 -translate-x-1/2 text-[10px] font-mono bg-primary text-primary-foreground px-1 rounded">
-                            {formatTimeCode(trimStart)}
+                          <div className="absolute -top-4 left-1/2 -translate-x-1/2 text-[10px] font-mono bg-primary text-primary-foreground px-1 rounded whitespace-nowrap">
+                            {formatTimeCode(trimStart, true)}
                           </div>
                         </div>
 
@@ -631,8 +641,8 @@ export function VideoToolsPage() {
                           style={{ left: `calc(${(trimEnd / duration) * 100}% - 3px)` }}
                           onMouseDown={(e) => handleTrimDrag(e, "end")}
                         >
-                          <div className="absolute -top-4 left-1/2 -translate-x-1/2 text-[10px] font-mono bg-primary text-primary-foreground px-1 rounded">
-                            {formatTimeCode(trimEnd)}
+                          <div className="absolute -top-4 left-1/2 -translate-x-1/2 text-[10px] font-mono bg-primary text-primary-foreground px-1 rounded whitespace-nowrap">
+                            {formatTimeCode(trimEnd, true)}
                           </div>
                         </div>
                       </>

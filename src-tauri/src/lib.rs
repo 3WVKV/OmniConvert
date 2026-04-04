@@ -2276,11 +2276,27 @@ fn write_text_file(path: String, content: String) -> Result<String, String> {
 #[tauri::command]
 fn ffmpeg_trim(input_path: String, output_path: String, start_time: String, end_time: String) -> Result<String, String> {
     let ffmpeg = find_ffmpeg();
-    // -ss before -i for fast seek, re-encode for precise cut (no keyframe issues)
+    // Parse times to compute duration (since -ss before -i makes -to relative)
+    let parse_time = |t: &str| -> f64 {
+        let parts: Vec<&str> = t.split('.').collect();
+        let hms: Vec<f64> = parts[0].split(':').map(|p| p.parse::<f64>().unwrap_or(0.0)).collect();
+        let secs = match hms.len() {
+            3 => hms[0] * 3600.0 + hms[1] * 60.0 + hms[2],
+            2 => hms[0] * 60.0 + hms[1],
+            _ => hms[0],
+        };
+        if parts.len() > 1 {
+            secs + format!("0.{}", parts[1]).parse::<f64>().unwrap_or(0.0)
+        } else { secs }
+    };
+    let dur = parse_time(&end_time) - parse_time(&start_time);
+    let duration_str = format!("{:.3}", dur.max(0.1));
+
+    // -ss before -i for fast seek, -t for duration, re-encode for precise cut
     let output = Command::new(&ffmpeg)
         .args([
             "-y", "-ss", &start_time, "-i", &input_path,
-            "-to", &end_time, "-ss", "0",
+            "-t", &duration_str,
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-c:a", "aac", "-b:a", "192k",
             "-avoid_negative_ts", "make_zero",

@@ -113,7 +113,7 @@
     "thumbnail": "Miniature",
     "startTime": "Début",
     "endTime": "Fin",
-    "timeFormat": "HH:MM:SS",
+    "timeFormat": "HH:MM:SS.mmm",
     "width": "Largeur",
     "height": "Hauteur",
     "crf": "Qualité (CRF)",
