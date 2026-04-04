@@ -2276,8 +2276,32 @@ fn write_text_file(path: String, content: String) -> Result<String, String> {
 #[tauri::command]
 fn ffmpeg_trim(input_path: String, output_path: String, start_time: String, end_time: String) -> Result<String, String> {
     let ffmpeg = find_ffmpeg();
+    // Parse times to compute duration (since -ss before -i makes -to relative)
+    let parse_time = |t: &str| -> f64 {
+        let parts: Vec<&str> = t.split('.').collect();
+        let hms: Vec<f64> = parts[0].split(':').map(|p| p.parse::<f64>().unwrap_or(0.0)).collect();
+        let secs = match hms.len() {
+            3 => hms[0] * 3600.0 + hms[1] * 60.0 + hms[2],
+            2 => hms[0] * 60.0 + hms[1],
+            _ => hms[0],
+        };
+        if parts.len() > 1 {
+            secs + format!("0.{}", parts[1]).parse::<f64>().unwrap_or(0.0)
+        } else { secs }
+    };
+    let dur = parse_time(&end_time) - parse_time(&start_time);
+    let duration_str = format!("{:.3}", dur.max(0.1));
+
+    // -ss before -i for fast seek, -t for duration, re-encode for precise cut
     let output = Command::new(&ffmpeg)
-        .args(["-y", "-i", &input_path, "-ss", &start_time, "-to", &end_time, "-c", "copy", &output_path])
+        .args([
+            "-y", "-ss", &start_time, "-i", &input_path,
+            "-t", &duration_str,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            "-avoid_negative_ts", "make_zero",
+            &output_path,
+        ])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
     if !output.status.success() {
@@ -2437,6 +2461,55 @@ fn ffmpeg_thumbnail(input_path: String, output_path: String, time: String) -> Re
         return Err(format!("ffmpeg thumbnail failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
     Ok(output_path)
+}
+
+#[tauri::command]
+fn ffmpeg_timeline_thumbnails(input_path: String, count: u32) -> Result<Vec<String>, String> {
+    let ffmpeg = find_ffmpeg();
+    let ffprobe = ffmpeg.replace("ffmpeg", "ffprobe");
+
+    // Get duration via ffprobe
+    let probe = Command::new(&ffprobe)
+        .args(["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", &input_path])
+        .output()
+        .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
+    let duration: f64 = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(10.0);
+
+    let count = count.min(30).max(5);
+    let interval = duration / count as f64;
+    let temp_dir = std::env::temp_dir().join("omniconvert_thumbs");
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let mut base64_thumbs = Vec::new();
+    for i in 0..count {
+        let time = interval * i as f64 + interval / 2.0;
+        let thumb_path = temp_dir.join(format!("thumb_{}.jpg", i));
+        let output = Command::new(&ffmpeg)
+            .args([
+                "-y", "-ss", &format!("{:.3}", time),
+                "-i", &input_path,
+                "-vframes", "1",
+                "-vf", "scale=160:-1",
+                "-q:v", "6",
+                thumb_path.to_str().unwrap_or(""),
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(data) = fs::read(&thumb_path) {
+                    base64_thumbs.push(STANDARD.encode(&data));
+                }
+            }
+        }
+        let _ = fs::remove_file(&thumb_path);
+    }
+
+    let _ = fs::remove_dir(&temp_dir);
+    Ok(base64_thumbs)
 }
 
 #[tauri::command]
@@ -2640,6 +2713,7 @@ pub fn run() {
             ffmpeg_rotate,
             ffmpeg_remove_audio,
             ffmpeg_thumbnail,
+            ffmpeg_timeline_thumbnails,
             get_media_info,
         ])
         .run(tauri::generate_context!())
