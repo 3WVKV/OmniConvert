@@ -2276,8 +2276,16 @@ fn write_text_file(path: String, content: String) -> Result<String, String> {
 #[tauri::command]
 fn ffmpeg_trim(input_path: String, output_path: String, start_time: String, end_time: String) -> Result<String, String> {
     let ffmpeg = find_ffmpeg();
+    // -ss before -i for fast seek, re-encode for precise cut (no keyframe issues)
     let output = Command::new(&ffmpeg)
-        .args(["-y", "-i", &input_path, "-ss", &start_time, "-to", &end_time, "-c", "copy", &output_path])
+        .args([
+            "-y", "-ss", &start_time, "-i", &input_path,
+            "-to", &end_time, "-ss", "0",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            "-avoid_negative_ts", "make_zero",
+            &output_path,
+        ])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
     if !output.status.success() {
