@@ -59,7 +59,7 @@ export function VideoToolsPage() {
   const [resizeHeight, setResizeHeight] = useState("720");
 
   // Compress
-  const [crf, setCrf] = useState(23);
+  const [quality, setQuality] = useState(55); // 0-100%, mapped to CRF 51-0
 
   // GIF
   const [gifFps, setGifFps] = useState("10");
@@ -206,7 +206,9 @@ export function VideoToolsPage() {
         case "compress": {
           const out = await getOutputPath("mp4", "compressed");
           if (!out) break;
-          await invoke("ffmpeg_compress", { inputPath: filePath, outputPath: out, crf });
+          // Convert quality% (0-100) to CRF (51-0): higher quality = lower CRF
+          const crfValue = Math.round(51 - (quality / 100) * 51);
+          await invoke("ffmpeg_compress", { inputPath: filePath, outputPath: out, crf: crfValue });
           toast.success(t("common.success"));
           break;
         }
@@ -471,15 +473,15 @@ export function VideoToolsPage() {
 
                 <TabsContent value="compress" className="mt-0 space-y-3">
                   <div className="space-y-1">
-                    <Label className="text-xs">{t("videoTools.crf")}: {crf}</Label>
+                    <Label className="text-xs">{t("videoTools.quality")}: {quality}%</Label>
                     <Slider
-                      value={[crf]}
-                      onValueChange={(v) => setCrf(Array.isArray(v) ? v[0] : v)}
-                      min={0}
-                      max={51}
+                      value={[quality]}
+                      onValueChange={(v) => setQuality(Array.isArray(v) ? v[0] : v)}
+                      min={1}
+                      max={100}
                       step={1}
                     />
-                    <p className="text-xs text-muted-foreground">{t("videoTools.crfHint")}</p>
+                    <p className="text-xs text-muted-foreground">{t("videoTools.qualityHint")}</p>
                   </div>
                 </TabsContent>
 

@@ -118,6 +118,8 @@
     "height": "Hauteur",
     "crf": "Qualité (CRF)",
     "crfHint": "Plus bas = meilleure qualité (18-28 recommandé)",
+    "quality": "Qualité",
+    "qualityHint": "100% = qualité originale, plus bas = fichier plus petit",
     "fps": "IPS",
     "gifWidth": "Largeur GIF (px)",
     "rotation90": "90° horaire",

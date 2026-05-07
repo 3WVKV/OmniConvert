@@ -6,6 +6,22 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+// ─── Hide console window on Windows ────────────────────────────────
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Create a Command that hides the console window on Windows
+fn silent_cmd(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 // ─── Data structures ───────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -124,7 +140,7 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
             if quality < 95 {
                 let ffmpeg = find_ffmpeg();
                 let q = quality.to_string();
-                let cmd_output = Command::new(&ffmpeg)
+                let cmd_output = silent_cmd(&ffmpeg)
                     .args(["-y", "-i", input, "-quality", &q, output])
                     .output();
                 match cmd_output {
@@ -170,14 +186,14 @@ fn convert_image(input: &str, output: &str, quality: u32) -> Result<String, Stri
         "heic" => {
             // HEIC encoding not natively supported — use ImageMagick/ffmpeg
             let magick = if cfg!(windows) { "magick" } else { "convert" };
-            let result = Command::new(magick)
+            let result = silent_cmd(magick)
                 .arg(input).arg(output)
                 .output();
             match result {
                 Ok(o) if o.status.success() => {}
                 _ => {
                     let ffmpeg = find_ffmpeg();
-                    let result2 = Command::new(&ffmpeg)
+                    let result2 = silent_cmd(&ffmpeg)
                         .args(["-y", "-i", input, output])
                         .output();
                     match result2 {
@@ -1361,7 +1377,7 @@ fn convert_archive(input: &str, output: &str) -> Result<String, String> {
 fn find_magick() -> String {
     if cfg!(windows) {
         // Check PATH first
-        if let Ok(output) = Command::new("magick").arg("--version").output() {
+        if let Ok(output) = silent_cmd("magick").arg("--version").output() {
             if output.status.success() {
                 return "magick".to_string();
             }
@@ -1398,7 +1414,7 @@ fn find_magick() -> String {
 /// Extract text from PDF: try pdftotext first, fallback to lopdf, then OCR
 fn extract_pdf_text(input: &str) -> Result<String, String> {
     // Try pdftotext (poppler-utils) first — much better extraction
-    if let Ok(output) = Command::new("pdftotext")
+    if let Ok(output) = silent_cmd("pdftotext")
         .arg("-layout")
         .arg(input)
         .arg("-")
@@ -1435,7 +1451,7 @@ fn extract_pdf_text(input: &str) -> Result<String, String> {
     let temp_img_str = temp_img.to_string_lossy().to_string();
 
     // Try ImageMagick to render PDF page to image
-    let img_result = Command::new(&magick)
+    let img_result = silent_cmd(&magick)
         .arg("-density").arg("300")
         .arg(format!("{}[0]", input))
         .arg("-depth").arg("8")
@@ -1447,7 +1463,7 @@ fn extract_pdf_text(input: &str) -> Result<String, String> {
         _ => {
             // Try pdftoppm fallback
             let temp_prefix = std::env::temp_dir().join(format!("omni_pdf_ocr_{}", std::process::id()));
-            let r = Command::new("pdftoppm")
+            let r = silent_cmd("pdftoppm")
                 .arg("-png").arg("-f").arg("1").arg("-l").arg("1")
                 .arg("-singlefile").arg("-r").arg("300")
                 .arg(input)
@@ -1471,7 +1487,7 @@ fn extract_pdf_text(input: &str) -> Result<String, String> {
         let tesseract = if cfg!(windows) { "tesseract" } else { "tesseract" };
         // Try French first, then English, then no language specified
         for lang in &["fra+eng", "eng", ""] {
-            let mut cmd = Command::new(tesseract);
+            let mut cmd = silent_cmd(tesseract);
             cmd.arg(&temp_img_str).arg("stdout");
             if !lang.is_empty() {
                 cmd.arg("-l").arg(lang);
@@ -1541,7 +1557,7 @@ fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
             let magick = find_magick();
 
             // Try ImageMagick first (most common on Windows)
-            let result = Command::new(&magick)
+            let result = silent_cmd(&magick)
                 .arg("-density").arg("200")
                 .arg(format!("{}[0]", input))
                 .arg("-quality").arg("95")
@@ -1567,7 +1583,7 @@ fn convert_from_pdf(input: &str, output: &str) -> Result<String, String> {
                 "tiff" => "-tiff",
                 _ => "-png",
             };
-            let result = Command::new("pdftoppm")
+            let result = silent_cmd("pdftoppm")
                 .arg(fmt_flag)
                 .arg("-f").arg("1").arg("-l").arg("1")
                 .arg("-singlefile").arg("-r").arg("200")
@@ -1650,7 +1666,7 @@ fn convert_file(
         "image" => convert_image(&input_path, &output_path, quality),
         "audio" | "video" => {
             let ffmpeg = find_ffmpeg();
-            let mut cmd = Command::new(&ffmpeg);
+            let mut cmd = silent_cmd(&ffmpeg);
             cmd.arg("-y")
                 .arg("-i")
                 .arg(&input_path);
@@ -2293,7 +2309,7 @@ fn ffmpeg_trim(input_path: String, output_path: String, start_time: String, end_
     let duration_str = format!("{:.3}", dur.max(0.1));
 
     // -ss before -i for fast seek, -t for duration, re-encode for precise cut
-    let output = Command::new(&ffmpeg)
+    let output = silent_cmd(&ffmpeg)
         .args([
             "-y", "-ss", &start_time, "-i", &input_path,
             "-t", &duration_str,
@@ -2322,7 +2338,7 @@ fn ffmpeg_merge_videos(input_paths: Vec<String>, output_path: String) -> Result<
         .join("\n");
     fs::write(&list_path, &list_content).map_err(|e| format!("Write list error: {}", e))?;
 
-    let output = Command::new(&ffmpeg)
+    let output = silent_cmd(&ffmpeg)
         .args(["-y", "-f", "concat", "-safe", "0", "-i"])
         .arg(&list_path)
         .args(["-c", "copy", &output_path])
@@ -2338,13 +2354,13 @@ fn ffmpeg_merge_videos(input_paths: Vec<String>, output_path: String) -> Result<
 #[tauri::command]
 fn ffmpeg_extract_audio(input_path: String, output_path: String) -> Result<String, String> {
     let ffmpeg = find_ffmpeg();
-    let output = Command::new(&ffmpeg)
+    let output = silent_cmd(&ffmpeg)
         .args(["-y", "-i", &input_path, "-vn", "-acodec", "copy", &output_path])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
     if !output.status.success() {
         // If copy codec fails, try re-encoding
-        let output2 = Command::new(&ffmpeg)
+        let output2 = silent_cmd(&ffmpeg)
             .args(["-y", "-i", &input_path, "-vn", "-q:a", "2", &output_path])
             .output()
             .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
@@ -2359,7 +2375,7 @@ fn ffmpeg_extract_audio(input_path: String, output_path: String) -> Result<Strin
 fn ffmpeg_resize(input_path: String, output_path: String, width: u32, height: u32) -> Result<String, String> {
     let ffmpeg = find_ffmpeg();
     let scale = format!("scale={}:{}", width, height);
-    let output = Command::new(&ffmpeg)
+    let output = silent_cmd(&ffmpeg)
         .args(["-y", "-i", &input_path, "-vf", &scale, "-c:a", "copy", &output_path])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
@@ -2372,7 +2388,7 @@ fn ffmpeg_resize(input_path: String, output_path: String, width: u32, height: u3
 #[tauri::command]
 fn ffmpeg_compress(input_path: String, output_path: String, crf: u32) -> Result<String, String> {
     let ffmpeg = find_ffmpeg();
-    let output = Command::new(&ffmpeg)
+    let output = silent_cmd(&ffmpeg)
         .args(["-y", "-i", &input_path, "-c:v", "libx264", "-crf", &crf.to_string(), "-preset", "medium", "-c:a", "aac", "-b:a", "128k", &output_path])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
@@ -2390,7 +2406,7 @@ fn ffmpeg_to_gif(input_path: String, output_path: String, fps: u32, width: u32) 
     let filter = format!("fps={},scale={}:-1:flags=lanczos", fps, width);
 
     // Pass 1: generate optimal palette
-    let pass1 = Command::new(&ffmpeg)
+    let pass1 = silent_cmd(&ffmpeg)
         .args(["-y", "-i", &input_path, "-vf", &format!("{},palettegen=stats_mode=diff", filter), &palette_path])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
@@ -2399,7 +2415,7 @@ fn ffmpeg_to_gif(input_path: String, output_path: String, fps: u32, width: u32) 
     }
 
     // Pass 2: use palette for high quality GIF
-    let pass2 = Command::new(&ffmpeg)
+    let pass2 = silent_cmd(&ffmpeg)
         .args([
             "-y", "-i", &input_path, "-i", &palette_path,
             "-lavfi", &format!("{} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5", filter),
@@ -2427,7 +2443,7 @@ fn ffmpeg_rotate(input_path: String, output_path: String, rotation: String) -> R
         "180" => "transpose=1,transpose=1",
         _ => return Err(format!("Invalid rotation: {}. Use 90, 180, or 270", rotation)),
     };
-    let output = Command::new(&ffmpeg)
+    let output = silent_cmd(&ffmpeg)
         .args(["-y", "-i", &input_path, "-vf", transpose, "-c:a", "copy", &output_path])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
@@ -2440,7 +2456,7 @@ fn ffmpeg_rotate(input_path: String, output_path: String, rotation: String) -> R
 #[tauri::command]
 fn ffmpeg_remove_audio(input_path: String, output_path: String) -> Result<String, String> {
     let ffmpeg = find_ffmpeg();
-    let output = Command::new(&ffmpeg)
+    let output = silent_cmd(&ffmpeg)
         .args(["-y", "-i", &input_path, "-an", "-c:v", "copy", &output_path])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
@@ -2453,7 +2469,7 @@ fn ffmpeg_remove_audio(input_path: String, output_path: String) -> Result<String
 #[tauri::command]
 fn ffmpeg_thumbnail(input_path: String, output_path: String, time: String) -> Result<String, String> {
     let ffmpeg = find_ffmpeg();
-    let output = Command::new(&ffmpeg)
+    let output = silent_cmd(&ffmpeg)
         .args(["-y", "-i", &input_path, "-ss", &time, "-vframes", "1", "-q:v", "2", &output_path])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
@@ -2469,7 +2485,7 @@ fn ffmpeg_timeline_thumbnails(input_path: String, count: u32) -> Result<Vec<Stri
     let ffprobe = ffmpeg.replace("ffmpeg", "ffprobe");
 
     // Get duration via ffprobe
-    let probe = Command::new(&ffprobe)
+    let probe = silent_cmd(&ffprobe)
         .args(["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", &input_path])
         .output()
         .map_err(|_| "FFMPEG_NOT_INSTALLED".to_string())?;
@@ -2487,7 +2503,7 @@ fn ffmpeg_timeline_thumbnails(input_path: String, count: u32) -> Result<Vec<Stri
     for i in 0..count {
         let time = interval * i as f64 + interval / 2.0;
         let thumb_path = temp_dir.join(format!("thumb_{}.jpg", i));
-        let output = Command::new(&ffmpeg)
+        let output = silent_cmd(&ffmpeg)
             .args([
                 "-y", "-ss", &format!("{:.3}", time),
                 "-i", &input_path,
@@ -2517,7 +2533,7 @@ fn get_media_info(path: String) -> Result<MediaInfo, String> {
     let ffmpeg = find_ffmpeg();
     // Use ffprobe if available, otherwise parse ffmpeg stderr
     let ffprobe = ffmpeg.replace("ffmpeg", "ffprobe");
-    let output = Command::new(&ffprobe)
+    let output = silent_cmd(&ffprobe)
         .args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", &path])
         .output();
 
@@ -2572,7 +2588,7 @@ fn ocr_extract(path: String, language: String) -> Result<OcrResult, String> {
     let tesseract = find_tesseract();
 
     // Check if tesseract exists before trying
-    let check = Command::new(&tesseract)
+    let check = silent_cmd(&tesseract)
         .arg("--version")
         .output();
 
@@ -2583,7 +2599,7 @@ fn ocr_extract(path: String, language: String) -> Result<OcrResult, String> {
         );
     }
 
-    let output = Command::new(&tesseract)
+    let output = silent_cmd(&tesseract)
         .arg(&path)
         .arg("stdout")
         .arg("-l")
@@ -2611,7 +2627,7 @@ fn ocr_extract(path: String, language: String) -> Result<OcrResult, String> {
 #[tauri::command]
 fn ocr_extract_base64(image_base64: String, language: String) -> Result<OcrResult, String> {
     let tesseract = find_tesseract();
-    let check = Command::new(&tesseract).arg("--version").output();
+    let check = silent_cmd(&tesseract).arg("--version").output();
     if check.is_err() {
         return Err("TESSERACT_NOT_INSTALLED".to_string());
     }
@@ -2628,7 +2644,7 @@ fn ocr_extract_base64(image_base64: String, language: String) -> Result<OcrResul
     let temp_path = temp_dir.join("ocr_temp_image.png");
     fs::write(&temp_path, &img_data).map_err(|e| format!("Write temp: {}", e))?;
 
-    let output = Command::new(&tesseract)
+    let output = silent_cmd(&tesseract)
         .arg(temp_path.to_string_lossy().as_ref())
         .arg("stdout")
         .arg("-l")
